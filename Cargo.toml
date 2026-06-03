@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # niri IPC. Per upstream: *not* semver-stable. Pin exactly. Bump deliberately when niri updates.
-niri-ipc = "=25.11.0"
+niri-ipc = "=26.4.0"
 
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "net", "signal", "process", "io-util"] }

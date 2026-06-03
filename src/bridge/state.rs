@@ -87,6 +87,11 @@ mod tests {
             workspace_id: Some(1),
             is_focused: false,
             is_floating: false,
+            column_index: Some(0),
+            position_in_column: Some(0),
+            width: 800,
+            height: 600,
+            floating_position: None,
         }
     }
 

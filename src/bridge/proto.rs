@@ -86,6 +86,33 @@ pub enum Op {
     },
     #[serde(rename = "window.toggle_floating")]
     WindowToggleFloating { id: u64 },
+    /// Move a window's column to a specific 0-based index. Symmetric with
+    /// `Window.column_index` (also 0-based) so a snapshot save → load
+    /// round-trip preserves placement. Bridge translates to niri's 1-based
+    /// `MoveColumnToIndex` internally; bridge also focuses the window
+    /// first since niri only acts on the focused column.
+    #[serde(rename = "window.move_column_to_index")]
+    WindowMoveColumnToIndex { id: u64, index: u32 },
+    /// Set a window's size in logical pixels. Works for tiled (column-width
+    /// / per-tile-height) and floating windows. Bridge sends two niri
+    /// actions in sequence; partial application on error is acceptable.
+    #[serde(rename = "window.set_size")]
+    WindowSetSize { id: u64, w: i32, h: i32 },
+    /// Set a floating window's (x, y) in workspace-view coordinates. niri
+    /// ignores this if the target is tiled — caller should ensure floating
+    /// state first via `window.toggle_floating`.
+    #[serde(rename = "window.set_floating_position")]
+    WindowSetFloatingPosition { id: u64, x: f64, y: f64 },
+
+    /// List pinned windows. Returns `[]` until W5 lands the pin set; kept
+    /// in the protocol now so `iris snapshot load --clear` doesn't need a
+    /// future client change to start respecting pins.
+    #[serde(rename = "pin.list")]
+    PinList,
+    /// List scratchpadded windows. Same forward-compat reasoning as
+    /// `pin.list`; populated in W6.
+    #[serde(rename = "scratchpad.list")]
+    ScratchpadList,
 
     /// Spawn a process. Bridge runs the command directly (NOT via niri's
     /// `Action::Spawn`) so the child inherits the user-session env that
@@ -141,6 +168,16 @@ pub mod topics {
 
 /// Bridge's normalized window record. Kept narrower than niri-ipc's so we
 /// can absorb upstream renames without breaking clients.
+///
+/// `column_index` and `position_in_column` are 0-based (niri uses 1-based;
+/// we subtract 1 at normalize time and add it back when forwarding actions
+/// like `MoveColumnToIndex`). Both are `None` when the window is floating
+/// or otherwise not in the scrolling layout.
+///
+/// `width` / `height` are the rendered tile size in logical pixels — for
+/// tiled windows that's column-width / per-tile-height (i.e. what
+/// `SetWindowWidth`/`SetWindowHeight` set), and for floating windows it's
+/// the window's own size. Always present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Window {
     pub id: u64,
@@ -150,6 +187,20 @@ pub struct Window {
     pub workspace_id: Option<u64>,
     pub is_focused: bool,
     pub is_floating: bool,
+    pub column_index: Option<u32>,
+    pub position_in_column: Option<u32>,
+    pub width: i32,
+    pub height: i32,
+    pub floating_position: Option<FloatingPosition>,
+}
+
+/// Floating window position in workspace-view coordinates (logical pixels).
+/// Captured from niri's `WindowLayout.tile_pos_in_workspace_view` when the
+/// window is floating; `None` for tiled windows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct FloatingPosition {
+    pub x: f64,
+    pub y: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +283,63 @@ mod tests {
             let v: Value = serde_json::to_value(&req).unwrap();
             assert_eq!(v["params"]["workspace"], expected);
         }
+    }
+
+    #[test]
+    fn move_column_to_index_wire_shape() {
+        let req = Request {
+            id: "m".into(),
+            op: Op::WindowMoveColumnToIndex { id: 7, index: 3 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "id": "m",
+                "op": "window.move_column_to_index",
+                "params": {"id": 7, "index": 3}
+            })
+        );
+    }
+
+    #[test]
+    fn set_size_wire_shape() {
+        let req = Request {
+            id: "s".into(),
+            op: Op::WindowSetSize { id: 7, w: 800, h: 600 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v["params"],
+            json!({"id": 7, "w": 800, "h": 600})
+        );
+    }
+
+    #[test]
+    fn set_floating_position_wire_shape() {
+        let req = Request {
+            id: "p".into(),
+            op: Op::WindowSetFloatingPosition { id: 7, x: 100.5, y: 200.0 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "window.set_floating_position");
+        assert_eq!(v["params"]["x"], 100.5);
+    }
+
+    #[test]
+    fn pin_and_scratchpad_list_wire_shape() {
+        let pin: Value = serde_json::to_value(&Request {
+            id: "p".into(),
+            op: Op::PinList,
+        })
+        .unwrap();
+        assert_eq!(pin, json!({"id": "p", "op": "pin.list"}));
+        let sp: Value = serde_json::to_value(&Request {
+            id: "s".into(),
+            op: Op::ScratchpadList,
+        })
+        .unwrap();
+        assert_eq!(sp, json!({"id": "s", "op": "scratchpad.list"}));
     }
 
     #[test]

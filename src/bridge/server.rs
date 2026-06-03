@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Request as NiriRequest, Response as NiriResponse};
+use niri_ipc::{
+    Action, PositionChange, Request as NiriRequest, Response as NiriResponse, SizeChange,
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -286,6 +288,55 @@ async fn handle_op(
             forward_action(action).await?;
             Ok(json!({}))
         }
+        Op::WindowMoveColumnToIndex { id, index } => {
+            // niri's MoveColumnToIndex acts on the focused column, so focus
+            // the target window first. The two actions are not atomic at
+            // the niri side — a user keybind firing in between could move
+            // a different column. Acceptable for v1.
+            //
+            // Wire `index` is 0-based to match `Window.column_index`; niri
+            // wants 1-based.
+            forward_action(Action::FocusWindow { id: *id }).await?;
+            forward_action(Action::MoveColumnToIndex {
+                index: (*index as usize).saturating_add(1),
+            })
+            .await?;
+            Ok(json!({}))
+        }
+        Op::WindowSetSize { id, w, h } => {
+            forward_action(Action::SetWindowWidth {
+                id: Some(*id),
+                change: SizeChange::SetFixed(*w),
+            })
+            .await?;
+            forward_action(Action::SetWindowHeight {
+                id: Some(*id),
+                change: SizeChange::SetFixed(*h),
+            })
+            .await?;
+            Ok(json!({}))
+        }
+        Op::WindowSetFloatingPosition { id, x, y } => {
+            forward_action(Action::MoveFloatingWindow {
+                id: Some(*id),
+                x: PositionChange::SetFixed(*x),
+                y: PositionChange::SetFixed(*y),
+            })
+            .await?;
+            Ok(json!({}))
+        }
+
+        Op::PinList => {
+            // Stub: pin set is bridge-owned but lives behind the W5 work.
+            // Returning [] here lets snapshot's --clear logic (W3) be
+            // forward-compatible — when W5 lands the pin set, this body
+            // changes; clients keep working.
+            Ok(json!([]))
+        }
+        Op::ScratchpadList => {
+            // Same as pin.list — lit up in W6.
+            Ok(json!([]))
+        }
 
         Op::Spawn { argv, env, request_activation_token } => {
             handle_spawn(broker, argv, env, *request_activation_token).await
@@ -360,7 +411,10 @@ async fn handle_spawn(
 
     // Register pid → token so niri_conn can stamp the matching event.
     if let (Some(b), Some(tok)) = (broker, &token) {
+        debug!(spawn_pid = pid, token = %tok, argv = ?argv, "spawn register_spawn");
         b.register_spawn(pid, tok.clone());
+    } else {
+        debug!(spawn_pid = pid, has_broker = broker.is_some(), has_token = token.is_some(), "spawn without broker registration");
     }
 
     // Reap the child in the background. We don't surface its exit status to
@@ -435,6 +489,11 @@ mod tests {
                         workspace_id: Some(10),
                         is_focused: true,
                         is_floating: false,
+                        column_index: Some(0),
+                        position_in_column: Some(0),
+                        width: 800,
+                        height: 600,
+                        floating_position: None,
                     },
                 );
                 s.workspaces.insert(
@@ -634,6 +693,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pin_and_scratchpad_list_return_empty() {
+        let (_tmp, path, _state, _task) = start_server().await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(&mut w, r#"{"id":"p","op":"pin.list"}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"], serde_json::json!([]));
+        send_line(&mut w, r#"{"id":"s","op":"scratchpad.list"}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn spawn_without_token_returns_pid() {
         // No broker, request_activation_token=false. `/usr/bin/env true` is
         // portable across Linux (`/bin/true`) and macOS (`/usr/bin/true`)
@@ -704,9 +777,10 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_two_in_a_row_get_distinct_tokens() {
-        // Plan §530-533 DoD: spawn foot twice → two distinct tokens.
-        // We can't actually spawn foot here, but the broker invariant —
-        // each mint_token produces a fresh token — is what the DoD relies on.
+        // Plan §530-533 DoD: spawn the same terminal twice → two distinct
+        // tokens. We don't actually spawn a terminal here (no Wayland in
+        // unit tests); the broker invariant — each mint_token produces a
+        // fresh token — is what the DoD relies on.
         let (_tmp, path, _state, _broker, _task) = start_server_with_broker().await;
         let (mut lines, mut w) = connect(&path).await;
         let mut tokens = Vec::new();
@@ -792,6 +866,138 @@ mod tests {
                 > 0,
             "expected niri to have at least one window or workspace; got {snap}"
         );
+    }
+
+    /// Live W2 DoD: spawn a terminal with a unique title and verify the
+    /// resulting `windows` event from niri carries the same activation
+    /// token we got back from the spawn op. Exercises the entire
+    /// pid-correlation pipeline end-to-end against a real niri + a real
+    /// xdg_activation_v1 compositor implementation.
+    ///
+    /// Requirements: `$NIRI_SOCKET` reachable, `$WAYLAND_DISPLAY` reachable
+    /// with `xdg_activation_v1` available (niri provides it), and a
+    /// terminal binary on PATH that accepts `--title <s>`. Defaults to
+    /// `kitty`; override via `$IRIS_TEST_TERMINAL` if that's not what
+    /// you have. Examples: `IRIS_TEST_TERMINAL=foot cargo test ...`,
+    /// `IRIS_TEST_TERMINAL=alacritty cargo test ...`.
+    #[tokio::test]
+    async fn live_spawn_token_round_trips_through_niri() {
+        // Tests don't run `main()` and so don't get the global tracing
+        // subscriber — making bridge debug logs invisible by default. Wire
+        // a per-test subscriber so `IRIS_LOG=debug cargo test ... --
+        // --nocapture` actually shows niri_conn / activation / server
+        // events. `try_init` is a no-op if a subscriber already exists,
+        // so this is safe to leave on permanently.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("IRIS_LOG")
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+            )
+            .with_target(true)
+            .with_test_writer()
+            .try_init();
+
+        let terminal_bin = std::env::var("IRIS_TEST_TERMINAL")
+            .unwrap_or_else(|_| "kitty".to_string());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("iris.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let state = SharedState::new();
+        let broker = crate::bridge::activation::ActivationBroker::start()
+            .expect("activation broker requires a live Wayland session");
+        let _niri = crate::bridge::niri_conn::spawn_niri_loop(state.clone(), Some(broker.clone()))
+            .await
+            .unwrap();
+        let _server = spawn_accept_loop(listener, state.clone(), Some(broker.clone()));
+        // Let niri_conn drain its initial WindowsChanged before we subscribe,
+        // so the events we subsequently read are reactions to OUR spawn, not
+        // the initial state replay.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (mut lines, mut w) = connect(&sock_path).await;
+        send_line(
+            &mut w,
+            r#"{"id":"s","op":"subscribe","params":{"topics":["windows"]}}"#,
+        )
+        .await;
+        let _ = read_one_line(&mut lines).await;
+
+        // Unique title is just informational at this point — kitty/foot
+        // both honor `--title`, but niri may emit the first
+        // `WindowOpenedOrChanged` BEFORE the client surface has set its
+        // title. We do NOT use it to identify our window; the activation
+        // token below does that.
+        let title = format!("iris-w2-{}-{}", std::process::id(), now_ms());
+        let req = format!(
+            r#"{{"id":"sp","op":"spawn","params":{{"argv":["{terminal_bin}","--title={title}"],"request_activation_token":true}}}}"#
+        );
+        send_line(&mut w, &req).await;
+
+        // Spawn response arrives before any niri window event (bridge
+        // writes it synchronously after `cmd.spawn()` returns; the child
+        // hasn't even opened its Wayland surface yet). Read it first.
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["id"], "sp");
+        assert!(resp["ok"].as_bool().unwrap(), "spawn failed: {resp}");
+        let spawn_token: String = resp["data"]["activation_token"]
+            .as_str()
+            .expect("token must be present when requested")
+            .to_string();
+
+        // Wait for a windows event whose `activation_token` matches.
+        // This is the heart of the W2 DoD: the token bridge minted MUST
+        // round-trip back via the windows topic. Match by token, not by
+        // title — niri emits MULTIPLE `WindowOpenedOrChanged` events per
+        // window (open + title-set + focus-change), and the bridge
+        // consumes the pid→token entry on the FIRST match. Only that
+        // first event carries the token; later ones for the same window
+        // do not. Title may also lag the first emit, so a title-based
+        // match would race the token-consumption.
+        let mut event_token: Option<String> = None;
+        let mut window_id: Option<u64> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while event_token.is_none() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let line = match timeout(remaining, lines.next_line()).await {
+                Ok(Ok(Some(l))) => l,
+                _ => panic!(
+                    "timed out waiting for windows event with token={spawn_token}"
+                ),
+            };
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v["event"] == "windows"
+                && let Some(t) = v["data"]["activation_token"].as_str()
+                && t == spawn_token
+            {
+                event_token = Some(t.to_string());
+                window_id = v["data"]["opened_or_changed"]["id"].as_u64();
+            }
+        }
+        assert_eq!(
+            event_token.as_deref(),
+            Some(spawn_token.as_str()),
+            "windows event token must equal spawn response token"
+        );
+
+        // Cleanup: close the spawned terminal window so we don't litter the user's session.
+        if let Some(id) = window_id {
+            let close = format!(r#"{{"id":"cl","op":"window.close","params":{{"id":{id}}}}}"#);
+            send_line(&mut w, &close).await;
+            // Read until we see the close response (more events may stream).
+            let close_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let remaining =
+                    close_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let Ok(Ok(Some(line))) = timeout(remaining, lines.next_line()).await else {
+                    break;
+                };
+                let v: Value = serde_json::from_str(&line).unwrap();
+                if v["id"] == "cl" {
+                    break;
+                }
+            }
+        }
     }
 
     #[tokio::test]

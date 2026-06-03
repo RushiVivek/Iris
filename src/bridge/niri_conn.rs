@@ -1,11 +1,14 @@
 //! Owns the connection(s) to niri's IPC socket.
 //!
-//! niri-ipc 25.x exposes a *blocking* `Socket`. We use two of them:
-//!  - one in a blocking thread that subscribes to `Request::EventStream`
-//!    and pumps every event back to tokio via an mpsc channel; this drives
-//!    the cached state and the broadcast fan-out.
-//!  - a second one re-opened per query for `query()` (cheap; niri's UDS
-//!    accept is fast and we do this only on action ops, not on hot paths).
+//! niri-ipc exposes a *blocking* `Socket`. We talk to niri two ways:
+//!  - The event stream lives in a blocking thread that connects to
+//!    `$NIRI_SOCKET` directly, sends `Request::EventStream`, then reads
+//!    JSON-lines forever and pumps each into tokio via an mpsc channel.
+//!    We bypass `Socket::read_events()` because its strict deserialize
+//!    breaks the stream on any future niri event variant we haven't
+//!    seen — see the comment on the spawn_blocking thread below.
+//!  - `query()` opens a fresh niri-ipc `Socket` per call (cheap; niri's
+//!    UDS accept is fast and we do this only on action ops).
 //!
 //! Reconnect: if the event-stream socket dies (niri restart, crash), we
 //! sleep with backoff and reconnect. On reconnect we emit a synthetic
@@ -13,9 +16,12 @@
 
 #![allow(dead_code)]
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{Event as NiriEvent, Reply, Request, Response, socket::Socket};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -69,25 +75,97 @@ async fn run_event_loop(state: SharedState, broker: Option<ActivationBroker>) {
 async fn connect_and_pump(state: SharedState, broker: Option<ActivationBroker>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<NiriEvent>(256);
 
-    // Blocking thread: opens Socket, subscribes, reads events forever,
-    // forwards each to the tokio side via `tx.blocking_send`.
-    let _reader = spawn_blocking(move || -> Result<()> {
-        let mut sock = Socket::connect().context("connecting to NIRI_SOCKET")?;
-        match sock.send(Request::EventStream)? {
+    // Blocking thread: opens a raw UnixStream to NIRI_SOCKET, sends the
+    // EventStream subscription request by hand, then reads JSON-lines
+    // forever and forwards each event to the tokio side.
+    //
+    // Why bypass niri-ipc's `Socket::read_events()`? It deserializes each
+    // incoming line into the strict `niri_ipc::Event` enum and bails on
+    // any unknown variant. niri ships new variants in minor versions
+    // (e.g. 26.04 added `CastsChanged`) — strict parsing means iris
+    // breaks the moment niri ships an event we haven't seen, even though
+    // we wouldn't act on it. Forward-compat with future niri releases is
+    // worth ~25 LOC: log-and-skip on deserialize failure, keep reading.
+    //
+    // Tradeoffs documented at `~/.claude/plans/once-revisit-the-plan-noble-pond.md`
+    // and the user's iris memory; this is the agreed approach.
+    let reader = spawn_blocking(move || -> Result<()> {
+        let socket_path = std::env::var_os(SOCKET_PATH_ENV).ok_or_else(|| {
+            anyhow!("{SOCKET_PATH_ENV} is not set, are you running this within niri?")
+        })?;
+        let stream = UnixStream::connect(&socket_path)
+            .with_context(|| format!("connecting to {}", socket_path.to_string_lossy()))?;
+
+        // Hand-serialize the EventStream request through niri-ipc's
+        // `Request` type so the JSON shape stays in lockstep with the
+        // crate even when we own the framing. Same reasoning for the
+        // ack `Reply` parse below.
+        let mut writer = stream;
+        let req = serde_json::to_string(&Request::EventStream)?;
+        writer.write_all(req.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+
+        let mut reader_buf = BufReader::new(writer);
+        let mut buf = String::new();
+
+        // First line is the ack. Anything other than Reply::Ok(Handled)
+        // is fatal — caller will reconnect. Surface immediate EOF
+        // (niri closed before responding) as a clear diagnostic rather
+        // than a generic serde "EOF while parsing" error.
+        if reader_buf.read_line(&mut buf)? == 0 {
+            return Err(anyhow!("niri closed connection before EventStream ack"));
+        }
+        let reply: Reply = serde_json::from_str(&buf)
+            .with_context(|| format!("parsing EventStream ack: {}", buf.trim()))?;
+        match reply {
             Ok(Response::Handled) => {}
             Ok(other) => return Err(anyhow!("unexpected event-stream reply: {other:?}")),
             Err(e) => return Err(anyhow!("niri rejected EventStream subscription: {e}")),
         }
-        let mut read_event = sock.read_events();
+
+        let mut events_read: u64 = 0;
+        let mut events_skipped: u64 = 0;
         loop {
-            match read_event() {
+            buf.clear();
+            match reader_buf.read_line(&mut buf) {
+                Ok(0) => {
+                    // EOF — niri closed the stream.
+                    debug!(events_read, events_skipped, "niri event stream EOF");
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(events_read, "niri read_line failed: {e}; reader exiting");
+                    return Err(anyhow!("read_line: {e}"));
+                }
+            }
+            // Skip whitespace-only lines defensively. niri doesn't send
+            // keepalives today, but a future protocol change could.
+            if buf.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<NiriEvent>(&buf) {
                 Ok(ev) => {
+                    events_read += 1;
+                    debug!(events_read, ?ev, "niri event read");
                     if tx.blocking_send(ev).is_err() {
-                        // Receiver dropped — caller went away.
+                        debug!(events_read, "niri event channel closed; reader exiting cleanly");
                         return Ok(());
                     }
                 }
-                Err(e) => return Err(anyhow!("read_events: {e}")),
+                Err(e) => {
+                    // Forward-compat: niri shipped a variant or field
+                    // niri-ipc doesn't recognize. Log + skip; the events
+                    // we DO understand still flow through.
+                    events_skipped += 1;
+                    warn!(
+                        events_skipped,
+                        error = %e,
+                        raw = %buf.trim(),
+                        "skipping unrecognized niri event"
+                    );
+                }
             }
         }
     });
@@ -100,6 +178,17 @@ async fn connect_and_pump(state: SharedState, broker: Option<ActivationBroker>) 
         if let Err(e) = handle_niri_event(&state, broker.as_ref(), ev).await {
             warn!("error handling niri event: {e:#}");
         }
+    }
+
+    // The reader's `tx` was dropped — surface what happened to it.
+    // Reachable only on a real failure mode now: the niri socket was
+    // closed by the compositor, an IO error on the read side, or the
+    // EventStream ack itself didn't parse. Unknown event variants are
+    // warn-and-skipped inside the reader and don't end the loop.
+    match reader.await {
+        Ok(Ok(())) => debug!("niri reader thread exited cleanly"),
+        Ok(Err(e)) => warn!("niri reader thread error: {e:#}"),
+        Err(join_err) => warn!("niri reader thread join error: {join_err}"),
     }
     Ok(())
 }
@@ -143,6 +232,14 @@ async fn handle_niri_event(
             // token.
             let activation_token = broker
                 .and_then(|b| window.pid.and_then(|pid| b.take_token_for_pid(pid)));
+            debug!(
+                window_id = id,
+                window_pid = ?window.pid,
+                app_id = ?window.app_id,
+                title = ?window.title,
+                stamped_token = ?activation_token,
+                "WindowOpenedOrChanged"
+            );
             state
                 .with_mut(|s| {
                     s.windows.insert(id, normalized.clone());
@@ -224,6 +321,25 @@ async fn handle_niri_event(
 }
 
 fn normalize_window(w: &niri_ipc::Window) -> proto::Window {
+    // niri reports `pos_in_scrolling_layout` as 1-based (column, tile);
+    // store 0-based so it round-trips through `MoveColumnToIndex` (which
+    // is also 1-based, so we add 1 back on the way out). `None` covers
+    // floating windows and any future "not in scrolling layout" state.
+    let (column_index, position_in_column) = match w.layout.pos_in_scrolling_layout {
+        Some((col, tile)) => (
+            Some(col.saturating_sub(1) as u32),
+            Some(tile.saturating_sub(1) as u32),
+        ),
+        None => (None, None),
+    };
+    let (tw, th) = w.layout.tile_size;
+    let floating_position = if w.is_floating {
+        w.layout
+            .tile_pos_in_workspace_view
+            .map(|(x, y)| proto::FloatingPosition { x, y })
+    } else {
+        None
+    };
     proto::Window {
         id: w.id,
         app_id: w.app_id.clone(),
@@ -232,6 +348,11 @@ fn normalize_window(w: &niri_ipc::Window) -> proto::Window {
         workspace_id: w.workspace_id,
         is_focused: w.is_focused,
         is_floating: w.is_floating,
+        column_index,
+        position_in_column,
+        width: tw.round() as i32,
+        height: th.round() as i32,
+        floating_position,
     }
 }
 
@@ -276,6 +397,39 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_window_extracts_layout_fields() {
+        // Tiled window in column 3 (1-based niri index → 2 0-based) at
+        // tile index 1 (1-based → 0 0-based), size 950×720.
+        let mut w = niri_window(99, Some(1));
+        w.layout.pos_in_scrolling_layout = Some((3, 1));
+        w.layout.tile_size = (950.4, 720.6);
+        let p = normalize_window(&w);
+        assert_eq!(p.column_index, Some(2));
+        assert_eq!(p.position_in_column, Some(0));
+        assert_eq!(p.width, 950);
+        assert_eq!(p.height, 721);
+        assert_eq!(p.floating_position, None);
+    }
+
+    #[test]
+    fn normalize_window_floating_captures_position() {
+        let mut w = niri_window(7, Some(2));
+        w.is_floating = true;
+        w.layout.pos_in_scrolling_layout = None;
+        w.layout.tile_size = (400.0, 300.0);
+        w.layout.tile_pos_in_workspace_view = Some((150.5, 200.25));
+        let p = normalize_window(&w);
+        assert_eq!(p.column_index, None);
+        assert_eq!(p.position_in_column, None);
+        assert_eq!(p.width, 400);
+        assert_eq!(p.height, 300);
+        assert_eq!(
+            p.floating_position,
+            Some(proto::FloatingPosition { x: 150.5, y: 200.25 })
+        );
+    }
 
     /// Minimal `niri_ipc::Window` for tests. Fields not under test get
     /// defaults that satisfy the type signatures.
