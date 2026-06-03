@@ -1,0 +1,58 @@
+[package]
+name = "iris"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "niri toolkit: bridge daemon + workspace snapshots, pin, scratchpad, time tracking"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# niri IPC — track the running niri's version. May need a bump if niri updates.
+niri-ipc = "25.5"
+
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "net", "signal", "process", "io-util"] }
+async-trait = "0.1"
+futures-util = "0.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Serde + wire formats
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Errors + logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Filesystem
+directories = "6"
+tempfile = "3"
+libc = "0.2"  # kill(pid, 0) for stale-pid detection
+
+# Time-tracking subcommand (rusqlite uses bundled libsqlite — no system dep)
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Lockscreen idle signals (logind via D-Bus). Used in bridge.
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+
+# XDG activation token brokering. Used in bridge.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.31", features = ["client", "staging"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+# Loud about real bugs; quiet about taste.
+all = { level = "warn", priority = -1 }
