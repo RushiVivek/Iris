@@ -22,22 +22,31 @@ use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
+use super::activation::ActivationBroker;
 use super::proto::{self, topics};
 use super::state::SharedState;
 
 /// Spawn the long-running task that owns the niri event stream + drives
 /// `state`. Returns a `JoinHandle` that completes only on a fatal error
 /// (we never give up — the loop reconnects forever).
-pub async fn spawn_niri_loop(state: SharedState) -> Result<JoinHandle<()>> {
+///
+/// `broker` is `Some` in production and `None` in unit tests that don't need
+/// XDG-activation correlation; when present, this loop drains the broker's
+/// pid → token map on each incoming `WindowOpenedOrChanged` and stamps the
+/// matching token onto the emitted `windows` event.
+pub async fn spawn_niri_loop(
+    state: SharedState,
+    broker: Option<ActivationBroker>,
+) -> Result<JoinHandle<()>> {
     Ok(tokio::spawn(async move {
-        run_event_loop(state).await;
+        run_event_loop(state, broker).await;
     }))
 }
 
-async fn run_event_loop(state: SharedState) {
+async fn run_event_loop(state: SharedState, broker: Option<ActivationBroker>) {
     let mut attempt: u32 = 0;
     loop {
-        match connect_and_pump(state.clone()).await {
+        match connect_and_pump(state.clone(), broker.clone()).await {
             Ok(_) => {
                 // Pump returned normally — niri closed the stream. Treat as disconnect.
                 warn!("niri event stream ended; will reconnect");
@@ -57,7 +66,7 @@ async fn run_event_loop(state: SharedState) {
 
 /// Open one event-stream socket, push events through a channel, drain into
 /// `state`. Returns when the channel closes (= blocking thread ended).
-async fn connect_and_pump(state: SharedState) -> Result<()> {
+async fn connect_and_pump(state: SharedState, broker: Option<ActivationBroker>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<NiriEvent>(256);
 
     // Blocking thread: opens Socket, subscribes, reads events forever,
@@ -88,7 +97,7 @@ async fn connect_and_pump(state: SharedState) -> Result<()> {
     emit_state_reset(&state);
 
     while let Some(ev) = rx.recv().await {
-        if let Err(e) = handle_niri_event(&state, ev).await {
+        if let Err(e) = handle_niri_event(&state, broker.as_ref(), ev).await {
             warn!("error handling niri event: {e:#}");
         }
     }
@@ -107,7 +116,11 @@ pub async fn query(req: Request) -> Result<Response> {
     .context("query task panicked")?
 }
 
-async fn handle_niri_event(state: &SharedState, ev: NiriEvent) -> Result<()> {
+async fn handle_niri_event(
+    state: &SharedState,
+    broker: Option<&ActivationBroker>,
+    ev: NiriEvent,
+) -> Result<()> {
     match ev {
         NiriEvent::WindowsChanged { windows } => {
             state
@@ -123,6 +136,13 @@ async fn handle_niri_event(state: &SharedState, ev: NiriEvent) -> Result<()> {
         NiriEvent::WindowOpenedOrChanged { window } => {
             let id = window.id;
             let normalized = normalize_window(&window);
+            // Match the spawn that produced this window via pid (niri-ipc
+            // 25.11.0 doesn't surface activation tokens in events). The
+            // broker drops the entry on first lookup, so a re-emit of
+            // WindowOpenedOrChanged for the same window won't get a stale
+            // token.
+            let activation_token = broker
+                .and_then(|b| window.pid.and_then(|pid| b.take_token_for_pid(pid)));
             state
                 .with_mut(|s| {
                     s.windows.insert(id, normalized.clone());
@@ -131,11 +151,11 @@ async fn handle_niri_event(state: &SharedState, ev: NiriEvent) -> Result<()> {
                     }
                 })
                 .await;
-            emit(
-                state,
-                topics::WINDOWS,
-                serde_json::json!({"opened_or_changed": normalized}),
-            );
+            let mut payload = serde_json::json!({"opened_or_changed": normalized});
+            if let Some(tok) = activation_token {
+                payload["activation_token"] = serde_json::Value::String(tok);
+            }
+            emit(state, topics::WINDOWS, payload);
         }
         NiriEvent::WindowClosed { id } => {
             state
@@ -251,4 +271,117 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal `niri_ipc::Window` for tests. Fields not under test get
+    /// defaults that satisfy the type signatures.
+    fn niri_window(id: u64, pid: Option<i32>) -> niri_ipc::Window {
+        niri_ipc::Window {
+            id,
+            title: Some("t".into()),
+            app_id: Some("foot".into()),
+            pid,
+            workspace_id: Some(1),
+            is_focused: false,
+            is_floating: false,
+            is_urgent: false,
+            layout: niri_ipc::WindowLayout {
+                pos_in_scrolling_layout: None,
+                tile_size: (0.0, 0.0),
+                window_size: (0, 0),
+                tile_pos_in_workspace_view: None,
+                window_offset_in_tile: (0.0, 0.0),
+            },
+            focus_timestamp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn window_opened_stamps_token_when_pid_matches() {
+        let state = SharedState::new();
+        let mut rx = state.subscribe();
+        let broker = ActivationBroker::test_handle();
+        broker.register_spawn(4242, "tok-spawn".into());
+
+        handle_niri_event(
+            &state,
+            Some(&broker),
+            NiriEvent::WindowOpenedOrChanged { window: niri_window(1, Some(4242)) },
+        )
+        .await
+        .unwrap();
+
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event, "windows");
+        assert_eq!(ev.data["activation_token"], "tok-spawn");
+        assert_eq!(ev.data["opened_or_changed"]["id"], 1);
+        // Broker entry consumed.
+        assert!(broker.take_token_for_pid(4242).is_none());
+    }
+
+    #[tokio::test]
+    async fn window_opened_without_match_omits_token() {
+        let state = SharedState::new();
+        let mut rx = state.subscribe();
+        let broker = ActivationBroker::test_handle();
+
+        handle_niri_event(
+            &state,
+            Some(&broker),
+            NiriEvent::WindowOpenedOrChanged { window: niri_window(2, Some(99)) },
+        )
+        .await
+        .unwrap();
+
+        let ev = rx.recv().await.unwrap();
+        // Field absent — null/missing both fine, but it must NOT be a string.
+        assert!(
+            ev.data.get("activation_token").is_none(),
+            "unexpected activation_token: {ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_opened_without_pid_omits_token() {
+        // Portal apps can have pid=None; we mustn't crash and mustn't stamp.
+        let state = SharedState::new();
+        let mut rx = state.subscribe();
+        let broker = ActivationBroker::test_handle();
+        broker.register_spawn(4242, "tok-orphan".into());
+
+        handle_niri_event(
+            &state,
+            Some(&broker),
+            NiriEvent::WindowOpenedOrChanged { window: niri_window(3, None) },
+        )
+        .await
+        .unwrap();
+
+        let ev = rx.recv().await.unwrap();
+        assert!(ev.data.get("activation_token").is_none());
+        // The 4242 registration is untouched — a future event with that pid
+        // would still match.
+        assert_eq!(broker.take_token_for_pid(4242).as_deref(), Some("tok-orphan"));
+    }
+
+    #[tokio::test]
+    async fn window_opened_without_broker_omits_token() {
+        let state = SharedState::new();
+        let mut rx = state.subscribe();
+
+        handle_niri_event(
+            &state,
+            None,
+            NiriEvent::WindowOpenedOrChanged { window: niri_window(4, Some(4242)) },
+        )
+        .await
+        .unwrap();
+
+        let ev = rx.recv().await.unwrap();
+        assert!(ev.data.get("activation_token").is_none());
+    }
 }

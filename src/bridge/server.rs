@@ -22,11 +22,16 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use super::activation::ActivationBroker;
 use super::niri_conn::query;
 use super::proto::{self, Op, Request, Response, ServerMessage};
 use super::state::{ClientSubs, SharedState};
 
-pub async fn spawn(sock_path: PathBuf, state: SharedState) -> Result<JoinHandle<()>> {
+pub async fn spawn(
+    sock_path: PathBuf,
+    state: SharedState,
+    broker: Option<ActivationBroker>,
+) -> Result<JoinHandle<()>> {
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("binding {}", sock_path.display()))?;
     // Make the socket user-only. The bind already happened with the process
@@ -36,21 +41,27 @@ pub async fn spawn(sock_path: PathBuf, state: SharedState) -> Result<JoinHandle<
         .with_context(|| format!("chmod 0600 {}", sock_path.display()))?;
 
     info!(socket = %sock_path.display(), "iris bridge listening");
-    Ok(spawn_accept_loop(listener, state))
+    Ok(spawn_accept_loop(listener, state, broker))
 }
 
 /// Accept-loop entry, factored out so tests can bind their own listener
 /// (on a tempfile-backed path) without going through `spawn`'s chmod path.
-fn spawn_accept_loop(listener: UnixListener, state: SharedState) -> JoinHandle<()> {
+/// `broker` is `None` in tests that don't exercise the spawn op.
+fn spawn_accept_loop(
+    listener: UnixListener,
+    state: SharedState,
+    broker: Option<ActivationBroker>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     let st = state.clone();
+                    let br = broker.clone();
                     tokio::spawn(async move {
                         let id = next_client_id();
                         debug!(client = id, "client connected");
-                        if let Err(e) = handle_client(stream, st).await {
+                        if let Err(e) = handle_client(stream, st, br).await {
                             warn!(client = id, "client task ended: {e:#}");
                         } else {
                             debug!(client = id, "client disconnected");
@@ -76,7 +87,11 @@ fn next_client_id() -> u64 {
 /// and a write half (sends Responses + Events). The write half is shared
 /// between the request-handler branch and the event-pump branch via a
 /// `Mutex<WriteHalf>`.
-async fn handle_client(stream: UnixStream, state: SharedState) -> Result<()> {
+async fn handle_client(
+    stream: UnixStream,
+    state: SharedState,
+    broker: Option<ActivationBroker>,
+) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(write_half));
     let subs = Arc::new(Mutex::new(ClientSubs::default()));
@@ -129,7 +144,7 @@ async fn handle_client(stream: UnixStream, state: SharedState) -> Result<()> {
                 continue;
             }
         };
-        let resp = dispatch_op(&state, &subs, &req).await;
+        let resp = dispatch_op(&state, &subs, broker.as_ref(), &req).await;
         if write_response(&writer, &resp).await.is_err() {
             break;
         }
@@ -178,9 +193,10 @@ impl Clone for Response {
 async fn dispatch_op(
     state: &SharedState,
     subs: &Arc<Mutex<ClientSubs>>,
+    broker: Option<&ActivationBroker>,
     req: &Request,
 ) -> Response {
-    match handle_op(state, subs, req).await {
+    match handle_op(state, subs, broker, req).await {
         Ok(data) => Response::ok(&req.id, data),
         Err(e) => Response::err(&req.id, format!("{e:#}")),
     }
@@ -189,6 +205,7 @@ async fn dispatch_op(
 async fn handle_op(
     state: &SharedState,
     subs: &Arc<Mutex<ClientSubs>>,
+    broker: Option<&ActivationBroker>,
     req: &Request,
 ) -> Result<serde_json::Value> {
     match &req.op {
@@ -270,6 +287,10 @@ async fn handle_op(
             Ok(json!({}))
         }
 
+        Op::Spawn { argv, env, request_activation_token } => {
+            handle_spawn(broker, argv, env, *request_activation_token).await
+        }
+
         Op::Subscribe { topics } => {
             let mut s = subs.lock().await;
             for t in topics {
@@ -293,6 +314,84 @@ async fn forward_action(action: Action) -> Result<()> {
         NiriResponse::Handled => Ok(()),
         other => anyhow::bail!("unexpected niri response: {other:?}"),
     }
+}
+
+async fn handle_spawn(
+    broker: Option<&ActivationBroker>,
+    argv: &[String],
+    env: &std::collections::HashMap<String, String>,
+    request_activation_token: bool,
+) -> Result<serde_json::Value> {
+    if argv.is_empty() {
+        anyhow::bail!("spawn requires non-empty argv");
+    }
+
+    // Mint the token *before* spawning so we can plant it in the child's env.
+    let token = if request_activation_token {
+        let b = broker.ok_or_else(|| {
+            anyhow::anyhow!("activation broker unavailable; bridge not started with Wayland support")
+        })?;
+        Some(b.mint_token().await?)
+    } else {
+        None
+    };
+
+    let mut cmd = build_spawn_command(argv, env, token.as_deref());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {:?}", argv))?;
+    // Pid extraction can technically fail (child already polled to
+    // completion / pid > i32::MAX). If we bail here the child is already
+    // running with no reaper attached — kill it on the way out so we don't
+    // leave an orphan.
+    let pid = match child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("spawned child has no pid"))
+        .and_then(|raw| {
+            i32::try_from(raw)
+                .map_err(|_| anyhow::anyhow!("spawned child pid {raw} doesn't fit in i32"))
+        }) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = child.kill().await;
+            return Err(e);
+        }
+    };
+
+    // Register pid → token so niri_conn can stamp the matching event.
+    if let (Some(b), Some(tok)) = (broker, &token) {
+        b.register_spawn(pid, tok.clone());
+    }
+
+    // Reap the child in the background. We don't surface its exit status to
+    // the spawn op's caller — the caller has the pid and can monitor itself.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    Ok(serde_json::json!({
+        "pid": pid,
+        "activation_token": token,
+    }))
+}
+
+/// Build the `Command` for a spawn op. Factored out of `handle_spawn` so
+/// tests can assert env plumbing (XDG_ACTIVATION_TOKEN + caller-supplied
+/// env) without actually spawning a process or talking to Wayland.
+fn build_spawn_command(
+    argv: &[String],
+    env: &std::collections::HashMap<String, String>,
+    token: Option<&str>,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    if let Some(tok) = token {
+        cmd.env("XDG_ACTIVATION_TOKEN", tok);
+    }
+    cmd
 }
 
 fn now_ms() -> i64 {
@@ -353,8 +452,28 @@ mod tests {
                 s.focused_workspace = Some(10);
             })
             .await;
-        let task = spawn_accept_loop(listener, state.clone());
+        let task = spawn_accept_loop(listener, state.clone(), None);
         (tmp, sock_path, state, task)
+    }
+
+    /// Like `start_server` but installs a fake-minter activation broker so
+    /// `spawn` ops requesting tokens can complete end-to-end. Returns the
+    /// broker handle alongside the usual quartet so tests can assert on
+    /// pid-map state directly.
+    async fn start_server_with_broker() -> (
+        TempDir,
+        std::path::PathBuf,
+        SharedState,
+        ActivationBroker,
+        JoinHandle<()>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("iris.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let state = SharedState::new();
+        let broker = ActivationBroker::test_handle_with_minter();
+        let task = spawn_accept_loop(listener, state.clone(), Some(broker.clone()));
+        (tmp, sock_path, state, broker, task)
     }
 
     /// Open a client connection and return (lines reader, write half).
@@ -515,18 +634,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn action_unknown_window_id_returns_error() {
+    async fn spawn_without_token_returns_pid() {
+        // No broker, request_activation_token=false. `/usr/bin/env true` is
+        // portable across Linux (`/bin/true`) and macOS (`/usr/bin/true`)
+        // without depending on $PATH containing the right thing.
         let (_tmp, path, _state, _task) = start_server().await;
         let (mut lines, mut w) = connect(&path).await;
-        // 0 is essentially never a valid window id; niri should reject.
         send_line(
             &mut w,
-            r#"{"id":"e","op":"window.focus","params":{"id":0}}"#,
+            r#"{"id":"sp","op":"spawn","params":{"argv":["/usr/bin/env","true"]}}"#,
+        )
+        .await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["id"], "sp");
+        assert_eq!(resp["ok"], true, "got: {resp}");
+        assert!(resp["data"]["pid"].as_i64().unwrap() > 0);
+        assert!(resp["data"]["activation_token"].is_null());
+    }
+
+    #[tokio::test]
+    async fn spawn_requesting_token_without_broker_errors_clearly() {
+        let (_tmp, path, _state, _task) = start_server().await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(
+            &mut w,
+            r#"{"id":"sp","op":"spawn","params":{"argv":["/usr/bin/env","true"],"request_activation_token":true}}"#,
         )
         .await;
         let resp = read_one_line(&mut lines).await;
         assert_eq!(resp["ok"], false);
-        assert!(resp["error"].is_string());
+        assert!(
+            resp["error"].as_str().unwrap().contains("broker"),
+            "expected broker-unavailable error, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_empty_argv_errors() {
+        let (_tmp, path, _state, _task) = start_server().await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(
+            &mut w,
+            r#"{"id":"sp","op":"spawn","params":{"argv":[]}}"#,
+        )
+        .await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().unwrap().contains("argv"));
+    }
+
+    #[tokio::test]
+    async fn spawn_with_broker_registers_pid_to_token() {
+        let (_tmp, path, _state, broker, _task) = start_server_with_broker().await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(
+            &mut w,
+            r#"{"id":"sp","op":"spawn","params":{"argv":["/usr/bin/env","true"],"request_activation_token":true}}"#,
+        )
+        .await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true, "got: {resp}");
+        let pid = resp["data"]["pid"].as_i64().unwrap() as i32;
+        let token = resp["data"]["activation_token"].as_str().unwrap().to_string();
+        assert!(token.starts_with("fake-token-"));
+        // The broker should have registered pid → token. take_token_for_pid
+        // returns the same string and consumes the entry.
+        assert_eq!(broker.take_token_for_pid(pid).as_deref(), Some(token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn spawn_two_in_a_row_get_distinct_tokens() {
+        // Plan §530-533 DoD: spawn foot twice → two distinct tokens.
+        // We can't actually spawn foot here, but the broker invariant —
+        // each mint_token produces a fresh token — is what the DoD relies on.
+        let (_tmp, path, _state, _broker, _task) = start_server_with_broker().await;
+        let (mut lines, mut w) = connect(&path).await;
+        let mut tokens = Vec::new();
+        for i in 0..2 {
+            let req = format!(
+                r#"{{"id":"sp{i}","op":"spawn","params":{{"argv":["/usr/bin/env","true"],"request_activation_token":true}}}}"#
+            );
+            send_line(&mut w, &req).await;
+            let resp = read_one_line(&mut lines).await;
+            assert_eq!(resp["ok"], true, "got: {resp}");
+            tokens.push(resp["data"]["activation_token"].as_str().unwrap().to_string());
+        }
+        assert_ne!(tokens[0], tokens[1], "tokens must be distinct per spawn");
+    }
+
+    #[test]
+    fn build_spawn_command_plants_token_and_env() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CALLER_SET".to_string(), "yes".to_string());
+        let cmd = build_spawn_command(
+            &["/usr/bin/env".to_string(), "true".to_string()],
+            &env,
+            Some("tok-abc"),
+        );
+        // Collect (key, value) of every env override the command will apply.
+        let envs: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                let v = v?;
+                Some((k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            })
+            .collect();
+        assert_eq!(envs.get("XDG_ACTIVATION_TOKEN").map(String::as_str), Some("tok-abc"));
+        assert_eq!(envs.get("CALLER_SET").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn build_spawn_command_omits_token_when_none() {
+        let env = std::collections::HashMap::new();
+        let cmd = build_spawn_command(
+            &["/usr/bin/env".to_string(), "true".to_string()],
+            &env,
+            None,
+        );
+        let has_token = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == std::ffi::OsStr::new("XDG_ACTIVATION_TOKEN"));
+        assert!(!has_token, "no token requested → no env var should be set");
     }
 
     #[tokio::test]
@@ -536,8 +766,8 @@ mod tests {
         let sock_path = tmp.path().join("iris.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let state = SharedState::new();
-        let _server = spawn_accept_loop(listener, state.clone());
-        let _niri = crate::bridge::niri_conn::spawn_niri_loop(state.clone())
+        let _server = spawn_accept_loop(listener, state.clone(), None);
+        let _niri = crate::bridge::niri_conn::spawn_niri_loop(state.clone(), None)
             .await
             .unwrap();
         // Give niri_conn a moment to populate the cache.

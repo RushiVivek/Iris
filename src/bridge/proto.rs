@@ -11,6 +11,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 // ───────────────────────────── Top-level envelope ─────────────────────────────
@@ -84,6 +86,21 @@ pub enum Op {
     },
     #[serde(rename = "window.toggle_floating")]
     WindowToggleFloating { id: u64 },
+
+    /// Spawn a process. Bridge runs the command directly (NOT via niri's
+    /// `Action::Spawn`) so the child inherits the user-session env that
+    /// bridge itself was launched in. If `request_activation_token` is true
+    /// the bridge mints an XDG activation token, sets `XDG_ACTIVATION_TOKEN`
+    /// in the child's env, and returns the token in the response so the
+    /// client can correlate the resulting `windows` event back to its spawn.
+    #[serde(rename = "spawn")]
+    Spawn {
+        argv: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        request_activation_token: bool,
+    },
 
     // ── Subscription control ─────────────────────────────────────────────────
     #[serde(rename = "subscribe")]
@@ -214,6 +231,46 @@ mod tests {
             };
             let v: Value = serde_json::to_value(&req).unwrap();
             assert_eq!(v["params"]["workspace"], expected);
+        }
+    }
+
+    #[test]
+    fn spawn_minimal_wire_shape() {
+        let line = r#"{"id":"sp","op":"spawn","params":{"argv":["foot"]}}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req.op {
+            Op::Spawn { argv, env, request_activation_token } => {
+                assert_eq!(argv, vec!["foot".to_string()]);
+                assert!(env.is_empty(), "env defaults to empty map");
+                assert!(!request_activation_token, "default false");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_full_wire_shape_round_trip() {
+        let mut env = HashMap::new();
+        env.insert("FOO".into(), "bar".into());
+        let req = Request {
+            id: "sp".into(),
+            op: Op::Spawn {
+                argv: vec!["foot".into(), "-e".into(), "fish".into()],
+                env,
+                request_activation_token: true,
+            },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "spawn");
+        assert_eq!(v["params"]["argv"], json!(["foot", "-e", "fish"]));
+        assert_eq!(v["params"]["env"]["FOO"], "bar");
+        assert_eq!(v["params"]["request_activation_token"], true);
+
+        // Round-trip back to the typed form too.
+        let parsed: Request = serde_json::from_value(v).unwrap();
+        match parsed.op {
+            Op::Spawn { argv, .. } => assert_eq!(argv.len(), 3),
+            _ => panic!("lost variant after round-trip"),
         }
     }
 

@@ -3,6 +3,7 @@
 //! subcommands talk to this daemon, never to niri directly.
 
 pub mod proto;
+mod activation;
 mod niri_conn;
 mod server;
 mod state;
@@ -41,9 +42,21 @@ pub async fn run(_args: BridgeArgs) -> Result<()> {
 
     // Wire up niri connection + state cache + server. Each runs as its own
     // tokio task; we wait until any of them exits or we receive SIGINT/SIGTERM.
+    //
+    // The activation broker is best-effort: if Wayland connect or the
+    // xdg_activation_v1 bind fails (no compositor reachable, missing global,
+    // …) we log + continue without it. The spawn op then refuses with a
+    // clear "broker unavailable" error, while every other op keeps working.
     let state = state::SharedState::new();
-    let niri = niri_conn::spawn_niri_loop(state.clone()).await?;
-    let server = server::spawn(sock_path.clone(), state.clone()).await?;
+    let broker = match activation::ActivationBroker::start() {
+        Ok(b) => Some(b),
+        Err(e) => {
+            warn!("activation broker disabled: {e:#}");
+            None
+        }
+    };
+    let niri = niri_conn::spawn_niri_loop(state.clone(), broker.clone()).await?;
+    let server = server::spawn(sock_path.clone(), state.clone(), broker.clone()).await?;
 
     // Graceful shutdown: SIGINT (Ctrl-C) or SIGTERM.
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
