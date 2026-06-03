@@ -71,3 +71,79 @@ impl ClientSubs {
         self.topics.contains(topic)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::proto;
+    use serde_json::json;
+
+    fn mk_window(id: u64, app_id: &str) -> proto::Window {
+        proto::Window {
+            id,
+            app_id: Some(app_id.into()),
+            title: Some("t".into()),
+            pid: Some(1234),
+            workspace_id: Some(1),
+            is_focused: false,
+            is_floating: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn with_mut_persists_writes_to_with() {
+        let s = SharedState::new();
+        s.with_mut(|inner| {
+            inner.windows.insert(1, mk_window(1, "foot"));
+            inner.focused_window = Some(1);
+        })
+        .await;
+        let (count, focused) = s.with(|inner| (inner.windows.len(), inner.focused_window)).await;
+        assert_eq!(count, 1);
+        assert_eq!(focused, Some(1));
+    }
+
+    #[tokio::test]
+    async fn broadcast_delivers_to_all_subscribers() {
+        let s = SharedState::new();
+        let mut a = s.subscribe();
+        let mut b = s.subscribe();
+        let ev = proto::Event {
+            event: proto::topics::FOCUS.into(),
+            ts: 0,
+            data: json!({"focused_window_id": 7}),
+        };
+        s.events.send(ev).unwrap();
+        let got_a = a.recv().await.unwrap();
+        let got_b = b.recv().await.unwrap();
+        assert_eq!(got_a.event, "focus");
+        assert_eq!(got_b.event, "focus");
+        assert_eq!(got_a.data["focused_window_id"], 7);
+    }
+
+    #[tokio::test]
+    async fn broadcast_no_subscribers_is_not_an_error() {
+        let s = SharedState::new();
+        // No one is subscribed — this should NOT panic or error; broadcast
+        // just drops the message. Real bridge code uses `let _ = send(...)`.
+        let res = s.events.send(proto::Event {
+            event: "x".into(),
+            ts: 0,
+            data: json!({}),
+        });
+        assert!(res.is_err(), "no subscribers means SendError");
+        // The point is the next operation works fine.
+        let _rx = s.subscribe();
+    }
+
+    #[test]
+    fn client_subs_topic_filter() {
+        let mut subs = ClientSubs::default();
+        assert!(!subs.matches("windows"));
+        subs.topics.insert("windows".into());
+        subs.topics.insert("focus".into());
+        assert!(subs.matches("windows"));
+        assert!(subs.matches("focus"));
+        assert!(!subs.matches("workspaces"));
+    }
+}

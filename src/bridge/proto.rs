@@ -145,11 +145,159 @@ pub struct Workspace {
     pub active_window_id: Option<u64>,
 }
 
-/// Reference to a workspace by id (stable while alive) or by index (1-based,
-/// matches niri's workspace-N keybinds).
+/// Reference to a workspace. Mirrors niri's `WorkspaceReferenceArg`:
+///   - `id`   — stable while the workspace is alive
+///   - `idx`  — 1-based, matches niri's workspace-N keybinds; *changes* on reorder
+///   - `name` — optional workspace name from niri config
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkspaceRef {
     Id { id: u64 },
     Idx { idx: u8 },
+    Name { name: String },
+}
+
+// ─────────────────────────────────── Tests ───────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// Round-trip a Request through JSON and check the wire shape we
+    /// document in the README is what serde actually produces.
+    #[test]
+    fn request_windows_list_wire_shape() {
+        let req = Request {
+            id: "abc".into(),
+            op: Op::WindowsList,
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v, json!({"id": "abc", "op": "windows.list"}));
+    }
+
+    #[test]
+    fn request_with_params_wire_shape() {
+        let req = Request {
+            id: "1".into(),
+            op: Op::WindowFocus { id: 42 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({"id": "1", "op": "window.focus", "params": {"id": 42}})
+        );
+    }
+
+    #[test]
+    fn move_to_workspace_with_each_ref_kind() {
+        for (variant, expected) in [
+            (
+                WorkspaceRef::Id { id: 7 },
+                json!({"id": 7}),
+            ),
+            (
+                WorkspaceRef::Idx { idx: 3 },
+                json!({"idx": 3}),
+            ),
+            (
+                WorkspaceRef::Name { name: "code".into() },
+                json!({"name": "code"}),
+            ),
+        ] {
+            let req = Request {
+                id: "x".into(),
+                op: Op::WindowMoveToWorkspace {
+                    id: 1,
+                    workspace: variant,
+                },
+            };
+            let v: Value = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["params"]["workspace"], expected);
+        }
+    }
+
+    #[test]
+    fn subscribe_topics_round_trip() {
+        let line = r#"{"id":"s","op":"subscribe","params":{"topics":["windows","focus"]}}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        match req.op {
+            Op::Subscribe { topics } => {
+                assert_eq!(topics, vec!["windows", "focus"]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_ok_serializes_with_data_no_error() {
+        let r = Response::ok("42", json!({"foo": 1}));
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["id"], "42");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"], json!({"foo": 1}));
+        assert!(v.get("error").is_none(), "error must be omitted on ok");
+    }
+
+    #[test]
+    fn response_err_serializes_with_error_no_data() {
+        let r = Response::err("42", "boom");
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "boom");
+        assert!(v.get("data").is_none(), "data must be omitted on err");
+    }
+
+    #[test]
+    fn server_message_event_round_trip() {
+        let ev = Event {
+            event: "windows".into(),
+            ts: 1_717_420_800_123,
+            data: json!({"closed": 7}),
+        };
+        let line = serde_json::to_string(&ServerMessage::Event(ev)).unwrap();
+        let parsed: ServerMessage = serde_json::from_str(&line).unwrap();
+        match parsed {
+            ServerMessage::Event(e) => {
+                assert_eq!(e.event, "windows");
+                assert_eq!(e.ts, 1_717_420_800_123);
+            }
+            ServerMessage::Response(_) => panic!("expected event"),
+        }
+    }
+
+    #[test]
+    fn server_message_response_round_trip() {
+        let line = r#"{"id":"1","ok":true,"data":[]}"#;
+        let parsed: ServerMessage = serde_json::from_str(line).unwrap();
+        match parsed {
+            ServerMessage::Response(r) => {
+                assert_eq!(r.id, "1");
+                assert!(r.ok);
+            }
+            ServerMessage::Event(_) => panic!("expected response"),
+        }
+    }
+
+    #[test]
+    fn unknown_op_fails_to_deserialize() {
+        // Defense-in-depth: unknown ops should be a parse error, not silently
+        // matched as something else.
+        let line = r#"{"id":"x","op":"definitely.not.a.real.op"}"#;
+        let r: Result<Request, _> = serde_json::from_str(line);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn topic_constants_match_documented_strings() {
+        // README + plan reference these as plain strings; if they ever rename
+        // here, clients break. Lock the names with this test.
+        assert_eq!(topics::WINDOWS, "windows");
+        assert_eq!(topics::WORKSPACES, "workspaces");
+        assert_eq!(topics::FOCUS, "focus");
+        assert_eq!(topics::FOCUS_SAMPLE, "focus.sample");
+        assert_eq!(topics::FOCUS_SESSION_END, "focus.session_end");
+        assert_eq!(topics::IDLE, "idle");
+        assert_eq!(topics::STATE, "state");
+    }
 }
