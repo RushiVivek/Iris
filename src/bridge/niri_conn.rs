@@ -54,19 +54,23 @@ async fn run_event_loop(state: SharedState, broker: Option<ActivationBroker>) {
     loop {
         match connect_and_pump(state.clone(), broker.clone()).await {
             Ok(_) => {
-                // Pump returned normally — niri closed the stream. Treat as disconnect.
+                // Pump returned cleanly — the EventStream subscription
+                // succeeded and niri eventually closed the connection
+                // (compositor restart, etc.). Reset backoff so the next
+                // reconnect doesn't carry the previous failure history.
                 warn!("niri event stream ended; will reconnect");
+                attempt = 0;
             }
             Err(e) => {
                 error!("niri event-stream error: {e:#}");
+                attempt = attempt.saturating_add(1);
             }
         }
-        // Exponential backoff capped at 5s, with mild jitter.
+        // Exponential backoff capped at 5s.
         let base = 1u64 << attempt.min(3); // 1, 2, 4, 8s capped below
         let secs = base.min(5);
         debug!("reconnecting to niri in {secs}s");
         sleep(Duration::from_secs(secs)).await;
-        attempt = attempt.saturating_add(1);
     }
 }
 

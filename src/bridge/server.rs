@@ -178,18 +178,6 @@ async fn write_event(
     Ok(())
 }
 
-// We need Clone on Response for write_response to take &Response. Add it.
-impl Clone for Response {
-    fn clone(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            ok: self.ok,
-            data: self.data.clone(),
-            error: self.error.clone(),
-        }
-    }
-}
-
 // ─────────────────────────────── Op dispatch ──────────────────────────────────
 
 async fn dispatch_op(

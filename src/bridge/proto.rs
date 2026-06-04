@@ -35,7 +35,7 @@ pub enum ServerMessage {
     Event(Event),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub id: String,
     pub ok: bool,

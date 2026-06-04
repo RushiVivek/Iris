@@ -38,6 +38,24 @@ pub fn read_snapshot(name: &str) -> Result<Snapshot> {
     Snapshot::from_path(&snapshot_path(name)?)
 }
 
+/// Read a snapshot by name, applying `{{var}}` template substitution
+/// against `vars` before parsing. See `snapshot::template` for syntax
+/// (`{{name}}`, `{{name:default}}`). Use this for `iris snapshot load`;
+/// `read_snapshot` is fine for any path that doesn't take user-supplied
+/// variables (`show`, internal tools, etc.).
+pub fn read_snapshot_with_vars(
+    name: &str,
+    vars: &std::collections::HashMap<String, String>,
+) -> Result<Snapshot> {
+    let path = snapshot_path(name)?;
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let expanded = super::template::expand(&raw, vars)
+        .with_context(|| format!("expanding template variables for snapshot {name}"))?;
+    Snapshot::from_toml(&expanded)
+        .with_context(|| format!("parsing snapshot {name} after template expansion"))
+}
+
 /// Atomically write a snapshot. Creates parent directories as needed.
 /// `force = false` errors if a snapshot with that name already exists,
 /// without TOCTOU between the existence check and the rename — see
@@ -176,6 +194,7 @@ mod tests {
                 width: 800,
                 height: 600,
                 floating: None,
+                hook: None,
             }],
         }
     }

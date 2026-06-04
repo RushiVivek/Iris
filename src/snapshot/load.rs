@@ -1,7 +1,11 @@
-//! `iris snapshot load NAME [--workspace IDX|NAME] [--clear] [--timeout SECS]`
+//! `iris snapshot load NAME [--workspace IDX|NAME] [--clear]
+//!  [--no-respawn] [--timeout SECS] [--var KEY=VALUE]...`
 //!
-//! Layout-only restore: assumes saved apps are already running, rearranges
-//! them. Respawning + per-app hooks are W4.
+//! Default mode is **always-respawn**: every saved entry gets launched
+//! fresh via its per-app hook, correlated back to its window via the
+//! W2 activation token, and placed by `apply_layout`. `--no-respawn`
+//! falls back to the W3 layout-only behavior (match already-running
+//! windows by `(app_id, title)`, rearrange them in place).
 //!
 //! Order of operations matters because niri auto-redistributes column
 //! widths and tile heights on insert/remove. The plan calls for:
@@ -17,16 +21,31 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tokio::time::timeout;
+use tracing::warn;
 
 use crate::bridge::proto::{Op, Window, WorkspaceRef};
 use crate::client::IrisClient;
 
+use super::hooks;
+use super::matcher::PendingSpawns;
 use super::schema::{Snapshot, WindowEntry};
 use super::store;
+
+/// Inter-spawn delay (plan §258). Gives niri's pid allocator + event
+/// dispatch time to settle between rapid spawns so the broker can
+/// disambiguate two same-app windows.
+const INTER_SPAWN_DELAY: Duration = Duration::from_millis(50);
+
+/// Per-spawn match timeout default (5s, plan §544). Heavy apps
+/// (browsers, electron) need slack on cold cache; native apps launch
+/// in milliseconds. Configurable via `--timeout`.
+const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `iris snapshot load` entry. CLI-level flags map onto the params.
 pub async fn run(
@@ -34,42 +53,269 @@ pub async fn run(
     name: String,
     workspace: Option<String>,
     clear: bool,
-    _timeout: Option<u64>,
+    no_respawn: bool,
+    spawn_timeout_secs: Option<u64>,
+    vars: HashMap<String, String>,
 ) -> Result<()> {
-    let snap = store::read_snapshot(&name)
+    let snap = store::read_snapshot_with_vars(&name, &vars)
         .with_context(|| format!("loading snapshot {name}"))?;
 
     // Resolve target workspace from --workspace flag or saved index.
     let target = resolve_target(client, workspace.as_deref(), snap.workspace.index).await?;
 
+    let spawn_timeout = spawn_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SPAWN_TIMEOUT);
+
+    if no_respawn {
+        run_match_existing(client, &name, &snap, target, clear).await
+    } else {
+        run_with_respawn(client, &name, &snap, target, clear, spawn_timeout).await
+    }
+}
+
+/// W3-style flow: match existing running windows by (app_id, title)
+/// and rearrange them. Used when `--no-respawn` is passed.
+async fn run_match_existing(
+    client: &IrisClient,
+    name: &str,
+    snap: &Snapshot,
+    target: Target,
+    clear: bool,
+) -> Result<()> {
     // Match BEFORE clearing so --clear doesn't accidentally close the
-    // saved windows themselves. We use the same windows.list snapshot for
-    // both deciding what to close and what to place; subsequent layout
-    // ops still resolve against live ids that survive the clear.
+    // saved windows themselves.
     let live = fetch_windows(client).await?;
     let pairs = match_pairs(&snap.windows, &live);
     let matched_ids: HashSet<u64> = pairs.iter().map(|(_, w)| w.id).collect();
 
     if clear {
-        let pinned = fetch_protected_set(client, Op::PinList).await?;
-        let scratch = fetch_protected_set(client, Op::ScratchpadList).await?;
-        let close_ids =
-            compute_clear_set(&live, target.id, &pinned, &scratch, &matched_ids);
-        for id in close_ids {
-            client.request(Op::WindowClose { id }).await
-                .with_context(|| format!("closing window {id} for --clear"))?;
-        }
+        do_clear(client, &live, target.id, &matched_ids).await?;
     }
 
-    apply_layout(client, &snap, &pairs, target.id).await?;
+    apply_layout(client, snap, &pairs, target.id).await?;
 
     let unmatched = snap.windows.len() - pairs.len();
     eprintln!(
-        "loaded snapshot {name}: {}/{} windows placed{}",
+        "loaded snapshot {name} (no-respawn): {}/{} windows placed{}",
         pairs.len(),
         snap.windows.len(),
-        if unmatched > 0 { format!(", {unmatched} unmatched") } else { String::new() }
+        if unmatched > 0 {
+            format!(", {unmatched} unmatched")
+        } else {
+            String::new()
+        }
     );
+    Ok(())
+}
+
+/// W4 default flow: clear (excluding pin/scratchpad), respawn each
+/// saved entry via its hook, correlate via activation token, then
+/// apply the layout.
+async fn run_with_respawn(
+    client: &IrisClient,
+    name: &str,
+    snap: &Snapshot,
+    target: Target,
+    clear: bool,
+    spawn_timeout: Duration,
+) -> Result<()> {
+    if clear {
+        // No matched-set exclusion here: respawn always produces fresh
+        // windows, so any existing windows on the target workspace are
+        // genuinely "leftover" relative to the saved layout. Pin and
+        // scratchpad windows ARE still excluded.
+        let live = fetch_windows(client).await?;
+        do_clear(client, &live, target.id, &HashSet::new()).await?;
+    }
+
+    let respawned = respawn_and_match(client, snap, spawn_timeout).await?;
+
+    // Re-fetch live windows AFTER respawn to get full `Window` structs
+    // (with current pid, app_id, title, etc.) for apply_layout. The
+    // respawned ids point into this fresh list.
+    let live = fetch_windows(client).await?;
+    let live_by_id: HashMap<u64, &Window> = live.iter().map(|w| (w.id, w)).collect();
+
+    let pairs: Vec<(&WindowEntry, &Window)> = respawned
+        .iter()
+        .filter_map(|(entry, id)| live_by_id.get(id).map(|w| (*entry, *w)))
+        .collect();
+
+    apply_layout(client, snap, &pairs, target.id).await?;
+
+    let placed = pairs.len();
+    let total = snap.windows.len();
+    let timed_out = total - respawned.len();
+    eprintln!(
+        "loaded snapshot {name}: {placed}/{total} respawned{}",
+        if timed_out > 0 {
+            format!(", {timed_out} timed out")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+/// Spawn each saved entry via its hook, await activation-token-stamped
+/// `windows` events, return `(saved_entry, niri_window_id)` pairs for
+/// the spawns that resolved within the timeout.
+///
+/// Spawn ops are issued sequentially with `INTER_SPAWN_DELAY` between
+/// each — niri's pid → window mapping needs settle time so two
+/// same-app spawns don't race the broker. Then we drain events from
+/// the subscription, dispatching each into `PendingSpawns`. Each
+/// per-spawn `oneshot` rx is awaited under `spawn_timeout`; misses are
+/// logged and dropped.
+async fn respawn_and_match<'s>(
+    client: &IrisClient,
+    snap: &'s Snapshot,
+    spawn_timeout: Duration,
+) -> Result<Vec<(&'s WindowEntry, u64)>> {
+    let mut events = client
+        .subscribe(&["windows"])
+        .await
+        .context("subscribing to windows topic for respawn correlation")?;
+    let pending = std::sync::Arc::new(tokio::sync::Mutex::new(PendingSpawns::new()));
+
+    // Background pump: drain events into the pending queue. Aborted at
+    // function exit so it doesn't outlive its mutex.
+    let pump_pending = pending.clone();
+    let pump = tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(ev) => pump_pending.lock().await.dispatch(&ev),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("event broadcast lagged {n} messages during respawn");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Issue spawns + collect (entry, oneshot rx).
+    let mut awaiting: Vec<(&'s WindowEntry, tokio::sync::oneshot::Receiver<u64>)> =
+        Vec::with_capacity(snap.windows.len());
+    for entry in &snap.windows {
+        match build_spawn_argv(entry) {
+            Ok(argv) => {
+                let resp = match client
+                    .request(Op::Spawn {
+                        argv,
+                        env: HashMap::new(),
+                        request_activation_token: true,
+                    })
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            save_id = entry.save_id,
+                            "spawn op failed: {e:#}; skipping",
+                        );
+                        continue;
+                    }
+                };
+                let Some(token) = resp.get("activation_token").and_then(Value::as_str) else {
+                    warn!(
+                        save_id = entry.save_id,
+                        "spawn response missing activation_token; skipping",
+                    );
+                    continue;
+                };
+                let rx = pending.lock().await.register(token.to_string());
+                awaiting.push((entry, rx));
+            }
+            Err(e) => {
+                warn!(
+                    save_id = entry.save_id,
+                    app_id = ?entry.app_id,
+                    "couldn't build spawn argv: {e:#}; skipping",
+                );
+            }
+        }
+        tokio::time::sleep(INTER_SPAWN_DELAY).await;
+    }
+
+    // Resolve each rx under the per-spawn timeout. Using `timeout`
+    // around each gives us per-spawn deadlines independent of when the
+    // spawn was issued — a fast app launched 5th still has its full
+    // budget.
+    let mut matched = Vec::with_capacity(awaiting.len());
+    for (entry, rx) in awaiting {
+        match timeout(spawn_timeout, rx).await {
+            Ok(Ok(window_id)) => matched.push((entry, window_id)),
+            Ok(Err(_)) => {
+                // oneshot sender dropped — pending was reset (shouldn't
+                // happen mid-flow) or PendingSpawns was dropped.
+                warn!(save_id = entry.save_id, "spawn rx canceled");
+            }
+            Err(_) => {
+                warn!(
+                    save_id = entry.save_id,
+                    app_id = ?entry.app_id,
+                    title = ?entry.title,
+                    "spawn timed out after {spawn_timeout:?}; window event never arrived"
+                );
+            }
+        }
+    }
+
+    pump.abort();
+    // Wait for the pump to actually stop so any in-flight `dispatch()`
+    // call finishes before we drop `pending`. Belt-and-suspenders: the
+    // mutex semantics already prevent races, but observing the abort
+    // here makes the function's exit deterministic.
+    let _ = pump.await;
+    Ok(matched)
+}
+
+/// Build the spawn argv for a saved entry by dispatching to the right
+/// hook. Returns Err if the entry has no hook AND no app_id (nothing
+/// to spawn) — caller logs + skips.
+fn build_spawn_argv(entry: &WindowEntry) -> Result<Vec<String>> {
+    if let Some(data) = &entry.hook {
+        let hook = hooks::dispatch(entry.app_id.as_deref());
+        return hook.build_argv(data);
+    }
+    // No hook captured (W3-era snapshot, or capture failed entirely
+    // and downgraded all the way to None). Best effort: spawn the
+    // app_id as a bare command and hope it's on PATH.
+    match entry.app_id.as_deref() {
+        Some(app_id) => Ok(vec![app_id.to_string()]),
+        None => anyhow::bail!("entry has no hook and no app_id; nothing to spawn"),
+    }
+}
+
+/// Shared clear logic — close every window on `target_id` that isn't
+/// pinned, scratchpadded, or in `keep_ids` (passed for the no-respawn
+/// path's "don't close windows we're about to place" exclusion).
+///
+/// Note: niri doesn't ack `WindowClose` synchronously. By the time
+/// this returns, the windows may still appear in `windows.list` for a
+/// moment — the niri-conn cache catches up via the next
+/// `WindowClosed` event. apply_layout (in the no-respawn path) takes
+/// its `pairs` from a `live` snapshot taken BEFORE the close, so it
+/// may emit ops against ids niri has already destroyed; niri silently
+/// ignores those (as confirmed in the W2 review pass that removed the
+/// `action_unknown_window_id_returns_error` test). Self-correcting,
+/// but worth a TODO if a later refactor wants stricter ordering.
+async fn do_clear(
+    client: &IrisClient,
+    live: &[Window],
+    target_id: u64,
+    keep_ids: &HashSet<u64>,
+) -> Result<()> {
+    let pinned = fetch_protected_set(client, Op::PinList).await?;
+    let scratch = fetch_protected_set(client, Op::ScratchpadList).await?;
+    let close_ids = compute_clear_set(live, target_id, &pinned, &scratch, keep_ids);
+    for id in close_ids {
+        client
+            .request(Op::WindowClose { id })
+            .await
+            .with_context(|| format!("closing window {id} for --clear"))?;
+    }
     Ok(())
 }
 
@@ -293,6 +539,7 @@ mod tests {
             width: 100,
             height: 100,
             floating: None,
+            hook: None,
         }
     }
 
@@ -511,6 +758,7 @@ mod tests {
             width: 800,
             height: 600,
             floating: None,
+            hook: None,
         };
         let saved_b = WindowEntry {
             save_id: 2,
@@ -523,6 +771,7 @@ mod tests {
             width: 700,
             height: 500,
             floating: None,
+            hook: None,
         };
         let live_a = mk_live(10, 99, "foot", "a"); // currently elsewhere
         let live_b = mk_live(20, 99, "foot", "b");
@@ -581,6 +830,7 @@ mod tests {
             width: 400,
             height: 300,
             floating: Some(FloatingPosition { x: 10.0, y: 20.0 }),
+            hook: None,
         };
         let live_already_floating = {
             let mut w = mk_live(10, 1, "foot", "a");
@@ -632,6 +882,7 @@ mod tests {
             width: 800,
             height: 600,
             floating: None,
+            hook: None,
         };
         let s0 = mk(1, 0, "a");
         let s1 = mk(2, 1, "b");
@@ -686,6 +937,7 @@ mod tests {
             width: 800,
             height: 300,
             floating: None,
+            hook: None,
         };
         let s0 = mk(1, "top", 0);
         let s1 = mk(2, "bot", 1);
@@ -721,5 +973,38 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert!(pairs[0].0.is_floating);
         assert!(!pairs[0].1.is_floating);
+    }
+
+    // ─── build_spawn_argv tests ───
+
+    #[test]
+    fn build_spawn_argv_uses_hook_when_present() {
+        let mut entry = mk_saved(1, "kitty", "shell");
+        entry.hook = Some(crate::snapshot::schema::HookData::Terminal {
+            app_id: "kitty".into(),
+            cwd: Some("/home/rushi".into()),
+            argv_fallback: vec!["kitty".into()],
+        });
+        let argv = build_spawn_argv(&entry).unwrap();
+        // Hook routes via dispatch → TerminalHook → kitty's --directory flag.
+        assert_eq!(argv, vec!["kitty", "--directory", "/home/rushi"]);
+    }
+
+    #[test]
+    fn build_spawn_argv_falls_back_to_app_id_when_no_hook() {
+        // Old W3-era snapshot or capture-failed entry: hook=None.
+        // Best-effort: spawn the app_id as a bare command.
+        let entry = mk_saved(1, "firefox", "GitHub");
+        assert!(entry.hook.is_none());
+        let argv = build_spawn_argv(&entry).unwrap();
+        assert_eq!(argv, vec!["firefox"]);
+    }
+
+    #[test]
+    fn build_spawn_argv_no_hook_no_app_id_errors() {
+        let mut entry = mk_saved(1, "ignored", "ignored");
+        entry.app_id = None;
+        let err = build_spawn_argv(&entry).unwrap_err();
+        assert!(format!("{err:#}").contains("nothing to spawn"));
     }
 }

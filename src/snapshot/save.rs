@@ -12,13 +12,17 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::bridge::proto::{Op, Window, Workspace};
 use crate::client::IrisClient;
 
+use super::hooks::{self, AppHook, GenericHook};
 use super::schema::{Snapshot, WindowEntry, WorkspaceMeta};
 use super::store;
 
@@ -36,8 +40,20 @@ pub async fn run(
         .context("requesting state.snapshot from bridge")?;
     let live = parse_state_snapshot(&snap_v)?;
 
+    // Pin/scratchpad windows are global UI furniture, not workspace-bound
+    // state; saving them would create duplicates when load respawns.
+    // Both ops return [] in W3 (stubs); W5/W6 fill in. Forward-compat
+    // with no client-side change required.
+    let protected_ids = fetch_protected_ids(client).await?;
+
     let target = resolve_target(&live, workspace.as_deref())?;
-    let snap = build_snapshot(&name, target, &live);
+    let mut snap = build_snapshot(&name, target, &live, &protected_ids);
+
+    // Hook capture is async + side-effecting (reads /proc, runs nvim
+    // RPC, etc.). Split from the pure layout build so test fixtures
+    // can construct a snapshot without a real /proc.
+    attach_hooks(&mut snap, &live).await;
+
     store::write_snapshot(&name, &snap, force)?;
     eprintln!(
         "saved snapshot {name} ({} windows from workspace idx {})",
@@ -45,6 +61,120 @@ pub async fn run(
         snap.workspace.index
     );
     Ok(())
+}
+
+/// Query the bridge's pin and scratchpad lists, union'd into a HashSet.
+/// Empty in W3 (stubs). On error, log + treat as empty so save still
+/// works in degraded mode.
+async fn fetch_protected_ids(client: &IrisClient) -> Result<HashSet<u64>> {
+    let mut ids = HashSet::new();
+    for op in [Op::PinList, Op::ScratchpadList] {
+        match client.request(op).await {
+            Ok(Value::Array(arr)) => {
+                ids.extend(arr.into_iter().filter_map(|v| v.as_u64()));
+            }
+            Ok(other) => {
+                warn!("expected array from pin/scratchpad list, got: {other}");
+            }
+            Err(e) => {
+                warn!("pin/scratchpad list failed: {e:#}; treating as empty");
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Dispatch per-window hook capture, with downgrade-to-Generic on
+/// failure. Mutates `snap.windows[i].hook` in place.
+///
+/// Pairs entries to live windows by `save_id`-was-derived-from-stable-sort
+/// order, but more directly: we walk `live.windows` filtered to the
+/// target workspace in the same order `build_snapshot` did. Re-deriving
+/// is safe because `build_snapshot` is pure and the input hasn't changed.
+async fn attach_hooks(snap: &mut Snapshot, live: &LiveState) {
+    // We need to re-pair WindowEntry → live Window so the hook's
+    // capture() sees app_id, pid, etc. The pairing logic here is
+    // structurally identical to `load::match_pairs`: walk saved
+    // entries in order, find the first-unused live window with
+    // matching `(app_id, title)`. The only reason this isn't a
+    // shared helper:
+    //   - Save sorts `live_on_target` by `(column_index,
+    //     position_in_column, id)` BEFORE matching, so the iteration
+    //     order on the live side mirrors `build_snapshot`'s sort.
+    //     This makes dup-pair behavior deterministic against the
+    //     same sort key snapshot.windows was built against.
+    //   - Load doesn't have a useful sort key — fresh windows.list
+    //     is unsorted relative to the saved layout — so it walks
+    //     declaration order on both sides.
+    // If `build_snapshot`'s sort key ever changes, update the sort
+    // here in lockstep or duplicate-pair behavior may diverge.
+    let target_id = live
+        .workspaces
+        .iter()
+        .find(|w| w.idx == snap.workspace.index)
+        .map(|w| w.id);
+
+    // Sort live windows by the SAME key build_snapshot uses, so the
+    // i-th entry in snap.windows corresponds to the i-th entry here.
+    // Without this matched ordering, duplicate (app_id, title) entries
+    // could re-pair to a different window than build_snapshot intended,
+    // misassigning hook data.
+    let mut live_on_target: Vec<&Window> = live
+        .windows
+        .iter()
+        .filter(|w| w.workspace_id == target_id)
+        .collect();
+    live_on_target.sort_by_key(|w| (
+        w.column_index.unwrap_or(u32::MAX),
+        w.position_in_column.unwrap_or(u32::MAX),
+        w.id,
+    ));
+
+    // Track which live entries have already been paired so duplicate
+    // (app_id, title) saved entries (e.g. two `kitty` terminals with the
+    // same default title) pair to DIFFERENT live windows. Same pattern
+    // as `load::match_pairs`. Belt-and-suspenders against both
+    // duplicate-pair issues at once: matched ordering (above) + first-
+    // unused match (below).
+    let mut used = vec![false; live_on_target.len()];
+
+    for entry in snap.windows.iter_mut() {
+        let pair = live_on_target.iter().enumerate().find(|(i, w)| {
+            !used[*i] && w.app_id == entry.app_id && w.title == entry.title
+        });
+        let Some((i, live_w)) = pair else {
+            // Couldn't re-pair — should be impossible since `entry`
+            // came from this same `live` set, but be defensive.
+            continue;
+        };
+        used[i] = true;
+
+        let hook = hooks::dispatch(live_w.app_id.as_deref());
+        let captured = match hook.capture(live_w).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                warn!(
+                    app_id = ?live_w.app_id,
+                    "hook {} capture failed: {e:#}; downgrading to generic",
+                    hook.name(),
+                );
+                // Downgrade: try GenericHook. If that also fails (no
+                // pid, no /proc/<pid>/cmdline, etc.), give up and store
+                // None — load will fall back to argv-only spawning.
+                match GenericHook.capture(live_w).await {
+                    Ok(data) => Some(data),
+                    Err(e2) => {
+                        warn!(
+                            app_id = ?live_w.app_id,
+                            "generic capture also failed: {e2:#}; window will respawn argv-less",
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        entry.hook = captured;
+    }
 }
 
 /// Parsed `state.snapshot` response. Splitting parse from logic so the
@@ -113,14 +243,21 @@ fn resolve_target<'a>(live: &'a LiveState, requested: Option<&str>) -> Result<Ta
     })
 }
 
-fn build_snapshot(name: &str, target: Target<'_>, live: &LiveState) -> Snapshot {
-    // Windows on the target workspace, stable-ordered by (column_index,
-    // position_in_column, id) so save_id assignment is deterministic
-    // across runs that produce the same set.
+fn build_snapshot(
+    name: &str,
+    target: Target<'_>,
+    live: &LiveState,
+    protected_ids: &HashSet<u64>,
+) -> Snapshot {
+    // Windows on the target workspace, MINUS pinned + scratchpadded
+    // (global UI furniture, see `run`). Stable-ordered by
+    // (column_index, position_in_column, id) so save_id assignment is
+    // deterministic across runs that produce the same set.
     let mut wins: Vec<&Window> = live
         .windows
         .iter()
         .filter(|w| w.workspace_id == Some(target.id))
+        .filter(|w| !protected_ids.contains(&w.id))
         .collect();
     wins.sort_by_key(|w| (
         w.column_index.unwrap_or(u32::MAX),
@@ -153,6 +290,10 @@ fn build_snapshot(name: &str, target: Target<'_>, live: &LiveState) -> Snapshot 
                 width: w.width,
                 height: w.height,
                 floating: w.floating_position,
+                // Hook capture happens in W4. v1 build_snapshot doesn't
+                // populate it; the W4 patch adds an async dispatch step
+                // that fills this in.
+                hook: None,
             }
         })
         .collect();
@@ -296,7 +437,7 @@ mod tests {
             focused_workspace_id: Some(10),
         };
         let target = resolve_target(&live, None).unwrap();
-        let snap = build_snapshot("test", target, &live);
+        let snap = build_snapshot("test", target, &live, &HashSet::new());
         assert_eq!(snap.windows.len(), 2);
         // Stable ordering: by column_index then id. id=1 col=0, id=3 col=1
         // → save_id 1 first, save_id 2 second.
@@ -316,7 +457,7 @@ mod tests {
             focused_workspace_id: Some(10),
         };
         let target = resolve_target(&live, None).unwrap();
-        let snap = build_snapshot("f", target, &live);
+        let snap = build_snapshot("f", target, &live, &HashSet::new());
         assert_eq!(snap.windows.len(), 1);
         assert!(snap.windows[0].is_floating);
         assert_eq!(
@@ -349,9 +490,37 @@ mod tests {
         };
         // Save ws 10 explicitly even though ws 20 is focused.
         let target = resolve_target(&live, Some("1")).unwrap();
-        let snap = build_snapshot("non-focused", target, &live);
+        let snap = build_snapshot("non-focused", target, &live, &HashSet::new());
         assert_eq!(snap.windows.len(), 2);
         assert_eq!(snap.workspace.focused_save_id, None);
+    }
+
+    #[test]
+    fn build_excludes_protected_ids() {
+        // Pinned/scratchpadded windows should be filtered out of save.
+        // Symmetric with --clear's load-side exclusion: they're global
+        // UI furniture, not workspace-bound state.
+        let live = LiveState {
+            windows: vec![
+                mk_window(1, 10, "foot", Some(0), Some(0), false, false),
+                mk_window(2, 10, "Slack", Some(1), Some(0), false, false),
+                mk_window(3, 10, "firefox", Some(2), Some(0), false, true),
+            ],
+            workspaces: vec![mk_workspace(10, 1, None, true)],
+            focused_window_id: Some(3),
+            focused_workspace_id: Some(10),
+        };
+        let target = resolve_target(&live, None).unwrap();
+        let mut protected = HashSet::new();
+        protected.insert(2); // Slack is pinned
+        let snap = build_snapshot("p", target, &live, &protected);
+        assert_eq!(snap.windows.len(), 2, "Slack should be filtered out");
+        let app_ids: Vec<&str> = snap
+            .windows
+            .iter()
+            .filter_map(|w| w.app_id.as_deref())
+            .collect();
+        assert_eq!(app_ids, vec!["foot", "firefox"]);
     }
 
     #[test]
@@ -363,7 +532,7 @@ mod tests {
             focused_workspace_id: Some(10),
         };
         let target = resolve_target(&live, None).unwrap();
-        let snap = build_snapshot("empty", target, &live);
+        let snap = build_snapshot("empty", target, &live, &HashSet::new());
         assert!(snap.windows.is_empty());
         assert_eq!(snap.workspace.focused_save_id, None);
     }

@@ -16,12 +16,12 @@ use directories::BaseDirs;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
+/// CLI args for `iris bridge`. Currently empty — file-logging via
+/// `--log-file` was planned but is deferred to W4.5 (along with the
+/// rolling log appender + desktop notifications). Keeping the struct
+/// here so adding a flag later doesn't churn the dispatch surface.
 #[derive(Args, Debug)]
-pub struct BridgeArgs {
-    /// Optional log file path. Stderr is always used; this adds a second sink.
-    #[arg(long)]
-    pub log_file: Option<PathBuf>,
-}
+pub struct BridgeArgs {}
 
 pub async fn run(_args: BridgeArgs) -> Result<()> {
     let runtime_dir = runtime_dir()?;
