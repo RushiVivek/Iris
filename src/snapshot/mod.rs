@@ -95,7 +95,7 @@ pub async fn run(args: SnapshotArgs) -> Result<()> {
         SnapshotCmd::List => list(),
         SnapshotCmd::Show { name } => show(&name),
         SnapshotCmd::Edit { name } => edit(&name),
-        SnapshotCmd::Delete { name, yes } => delete(&name, yes),
+        SnapshotCmd::Delete { name, yes } => delete(&name, yes).await,
     }
 }
 
@@ -183,13 +183,14 @@ fn which_on_path(bin: &str) -> bool {
     false
 }
 
-fn delete(name: &str, yes: bool) -> Result<()> {
+async fn delete(name: &str, yes: bool) -> Result<()> {
     if !yes && !confirm(&format!("delete snapshot {name}?"))? {
         eprintln!("aborted");
         return Ok(());
     }
     store::delete_snapshot(name)?;
     eprintln!("deleted {name}");
+    crate::notify::info("snapshot deleted", name).await;
     Ok(())
 }
 

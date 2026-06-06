@@ -106,6 +106,15 @@ async fn run_match_existing(
             String::new()
         }
     );
+    crate::notify::info(
+        "snapshot loaded",
+        &format!(
+            "{name} ({}/{} placed)",
+            pairs.len(),
+            snap.windows.len(),
+        ),
+    )
+    .await;
     Ok(())
 }
 
@@ -155,6 +164,18 @@ async fn run_with_respawn(
             String::new()
         }
     );
+    crate::notify::info(
+        "snapshot loaded",
+        &format!(
+            "{name} ({placed}/{total} respawned{})",
+            if timed_out > 0 {
+                format!(", {timed_out} timed out")
+            } else {
+                String::new()
+            }
+        ),
+    )
+    .await;
     Ok(())
 }
 

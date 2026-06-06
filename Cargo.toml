@@ -41,12 +41,16 @@ libc = "0.2"  # kill(pid, 0) for stale-pid detection
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# Lockscreen idle signals (logind via D-Bus). Used in bridge.
-zbus = { version = "4", default-features = false, features = ["tokio"] }
-
 # XDG activation token brokering. Used in bridge.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.31", features = ["client", "staging"] }
+
+# Desktop notifications. Pulls zbus 5 transitively; keep it as the only
+# D-Bus stack. When W7 needs logind, use the same zbus version.
+notify-rust = { version = "4.17", default-features = false, features = ["z-with-tokio"] }
+
+# Rolling daily log files for `iris.log`.
+tracing-appender = "0.2"
 
 [profile.release]
 lto = "thin"

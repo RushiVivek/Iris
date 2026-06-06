@@ -14,6 +14,14 @@ use crate::time::TimeArgs;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+
+    /// Force desktop notifications on, regardless of stderr TTY.
+    #[arg(long, global = true, conflicts_with = "no_toast")]
+    pub toast: bool,
+
+    /// Force desktop notifications off, regardless of stderr TTY.
+    #[arg(long = "no-toast", global = true)]
+    pub no_toast: bool,
 }
 
 #[derive(Subcommand, Debug)]

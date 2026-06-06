@@ -60,6 +60,15 @@ pub async fn run(
         snap.windows.len(),
         snap.workspace.index
     );
+    crate::notify::info(
+        "snapshot saved",
+        &format!(
+            "{name} ({} windows from ws {})",
+            snap.windows.len(),
+            snap.workspace.index,
+        ),
+    )
+    .await;
     Ok(())
 }
 
