@@ -3,6 +3,7 @@
 mod bridge;
 mod cli;
 mod client;
+mod config;
 mod notify;
 mod paths;
 mod pin;

@@ -31,6 +31,10 @@ pub struct Inner {
     pub workspaces: HashMap<u64, Workspace>,
     pub focused_window: Option<u64>,
     pub focused_workspace: Option<u64>,
+    /// Set of window ids the user has pinned via `iris pin`. Bridge moves
+    /// each pinned window to the new active workspace on
+    /// `WorkspaceActivated`. Persisted to `${XDG_STATE_HOME}/iris/pinned.toml`.
+    pub pinned_windows: HashSet<u64>,
 }
 
 impl SharedState {
@@ -42,6 +46,7 @@ impl SharedState {
                 workspaces: HashMap::new(),
                 focused_window: None,
                 focused_workspace: None,
+                pinned_windows: HashSet::new(),
             })),
             events: tx,
         }

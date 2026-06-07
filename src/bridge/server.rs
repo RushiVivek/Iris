@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use super::activation::ActivationBroker;
 use super::niri_conn::query;
+use super::pinned;
 use super::proto::{self, Op, Request, Response, ServerMessage};
 use super::state::{ClientSubs, SharedState};
 
@@ -314,15 +315,99 @@ async fn handle_op(
             Ok(json!({}))
         }
 
+        Op::PinAdd { window_id } => {
+            let outcome = try_pin(state, *window_id).await;
+            // Persist whenever `try_pin` mutated the in-memory set,
+            // including the err-after-removal branch (already_pinned
+            // + now-tiled drops the stale id and bails). Without this,
+            // memory and disk would disagree until the next op.
+            if outcome.mutated {
+                if let Err(e) = pinned::persist(state).await {
+                    tracing::warn!("pin persist failed: {e:#}");
+                }
+            }
+            outcome.result?;
+            // Uniform with pin.toggle / pin.remove: callers can read
+            // `data.pinned` across all three ops to learn the new state.
+            Ok(json!({"pinned": true}))
+        }
+        Op::PinRemove { window_id } => {
+            let was = state
+                .with_mut(|s| s.pinned_windows.remove(window_id))
+                .await;
+            if was {
+                if let Err(e) = pinned::persist(state).await {
+                    tracing::warn!("pin persist failed: {e:#}");
+                }
+            }
+            Ok(json!({"pinned": false}))
+        }
+        Op::PinToggle { window_id } => {
+            // Atomic: read state, decide add vs remove, mutate — all
+            // under one with_mut so a Mod+V toggle landing between the
+            // read and the mutation can't slip through. The is_floating
+            // / app_id checks happen inside the closure too.
+            enum Outcome {
+                Pinned,
+                Unpinned,
+            }
+            let outcome = state
+                .with_mut(|s| -> Result<Outcome, anyhow::Error> {
+                    if s.pinned_windows.remove(window_id) {
+                        return Ok(Outcome::Unpinned);
+                    }
+                    let w = s
+                        .windows
+                        .get(window_id)
+                        .ok_or_else(|| anyhow::anyhow!("no window with id {window_id}"))?;
+                    if !w.is_floating {
+                        anyhow::bail!(
+                            "only floating windows can be pinned; toggle floating first with Mod+V"
+                        );
+                    }
+                    if w.app_id.as_deref().unwrap_or("").is_empty() {
+                        anyhow::bail!(
+                            "cannot pin window {window_id}: it reports no app_id, so we couldn't restore the pin across bridge restarts"
+                        );
+                    }
+                    s.pinned_windows.insert(*window_id);
+                    Ok(Outcome::Pinned)
+                })
+                .await?;
+            if let Err(e) = pinned::persist(state).await {
+                tracing::warn!("pin persist failed: {e:#}");
+            }
+            match outcome {
+                Outcome::Pinned => Ok(json!({"pinned": true})),
+                Outcome::Unpinned => Ok(json!({"pinned": false})),
+            }
+        }
+        Op::PinOff => {
+            let n = state
+                .with_mut(|s| {
+                    let n = s.pinned_windows.len();
+                    s.pinned_windows.clear();
+                    n
+                })
+                .await;
+            if let Err(e) = pinned::persist(state).await {
+                tracing::warn!("pin persist failed: {e:#}");
+            }
+            Ok(json!({"n_unpinned": n}))
+        }
         Op::PinList => {
-            // Stub: pin set is bridge-owned but lives behind the W5 work.
-            // Returning [] here lets snapshot's --clear logic (W3) be
-            // forward-compatible — when W5 lands the pin set, this body
-            // changes; clients keep working.
-            Ok(json!([]))
+            let pinned = state
+                .with(|s| {
+                    s.pinned_windows
+                        .iter()
+                        .filter_map(|id| s.windows.get(id).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            Ok(json!(pinned))
         }
         Op::ScratchpadList => {
-            // Same as pin.list — lit up in W6.
+            // Stub through W5; W6 lights it up.
             Ok(json!([]))
         }
 
@@ -353,6 +438,78 @@ async fn forward_action(action: Action) -> Result<()> {
         NiriResponse::Handled => Ok(()),
         other => anyhow::bail!("unexpected niri response: {other:?}"),
     }
+}
+
+/// Outcome of `try_pin`. `mutated` says whether the in-memory pin set
+/// changed (so the caller knows whether to persist), regardless of
+/// whether `result` is Ok or Err — the err-after-removal branch
+/// (already-pinned + now-tiled) still mutated and must be persisted.
+struct PinOutcome {
+    mutated: bool,
+    result: Result<bool>,
+}
+
+/// Atomic pin-add: validation (window exists, floating, has app_id) and
+/// the `pinned_windows.insert` happen under one `with_mut`, so a
+/// `Mod+V` toggle racing between check and insert can't sneak through.
+///
+/// Returns `Ok(true)` if a fresh pin was inserted, `Ok(false)` if the
+/// id was already pinned and still floating (idempotent), or `Err`:
+/// stale pin dropped, no such window, non-floating, or no app_id.
+async fn try_pin(state: &SharedState, window_id: u64) -> PinOutcome {
+    state
+        .with_mut(|s| -> PinOutcome {
+            // Validate against live cache first — if the window has
+            // gone tiled (or vanished) since the pin landed (e.g. a
+            // broadcast Lagged delayed auto-unpin), drop the stale
+            // entry so the response truthfully reflects the current
+            // floating-only invariant.
+            let live_floating = match s.windows.get(&window_id) {
+                Some(w) => w.is_floating,
+                None => false,
+            };
+            let already_pinned = s.pinned_windows.contains(&window_id);
+            if already_pinned && !live_floating {
+                s.pinned_windows.remove(&window_id);
+                return PinOutcome {
+                    mutated: true,
+                    result: Err(anyhow::anyhow!(
+                        "pin on {window_id} dropped: window is no longer floating"
+                    )),
+                };
+            }
+            if already_pinned {
+                return PinOutcome { mutated: false, result: Ok(false) };
+            }
+            let w = match s.windows.get(&window_id) {
+                Some(w) => w,
+                None => {
+                    return PinOutcome {
+                        mutated: false,
+                        result: Err(anyhow::anyhow!("no window with id {window_id}")),
+                    };
+                }
+            };
+            if !w.is_floating {
+                return PinOutcome {
+                    mutated: false,
+                    result: Err(anyhow::anyhow!(
+                        "only floating windows can be pinned; toggle floating first with Mod+V"
+                    )),
+                };
+            }
+            if w.app_id.as_deref().unwrap_or("").is_empty() {
+                return PinOutcome {
+                    mutated: false,
+                    result: Err(anyhow::anyhow!(
+                        "cannot pin window {window_id}: it reports no app_id, so we couldn't restore the pin across bridge restarts"
+                    )),
+                };
+            }
+            s.pinned_windows.insert(window_id);
+            PinOutcome { mutated: true, result: Ok(true) }
+        })
+        .await
 }
 
 async fn handle_spawn(
@@ -681,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_and_scratchpad_list_return_empty() {
+    async fn pin_list_starts_empty_and_scratchpad_list_returns_stub() {
         let (_tmp, path, _state, _task) = start_server().await;
         let (mut lines, mut w) = connect(&path).await;
         send_line(&mut w, r#"{"id":"p","op":"pin.list"}"#).await;
@@ -692,6 +849,162 @@ mod tests {
         let resp = read_one_line(&mut lines).await;
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"], serde_json::json!([]));
+    }
+
+    /// Seed the server with one floating window so pin.toggle has a
+    /// valid target. Returns `((tmp_sock_dir, tmp_xdg_dir), sock_path, state, task)`.
+    /// Pinned-state writes are redirected to the tempdir via
+    /// `pinned::set_test_dir_override` (a process-wide override that is
+    /// safe across parallel tests because each call replaces the
+    /// previous value while the same lock serializes file writes).
+    async fn start_server_with_floating_window() -> (
+        (TempDir, TempDir),
+        std::path::PathBuf,
+        SharedState,
+        JoinHandle<()>,
+    ) {
+        let xdg = tempfile::tempdir().unwrap();
+        super::pinned::set_test_dir_override(Some(xdg.path().to_path_buf())).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("iris.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let state = SharedState::new();
+        state
+            .with_mut(|s| {
+                s.windows.insert(
+                    1,
+                    p::Window {
+                        id: 1,
+                        app_id: Some("kitty".into()),
+                        title: Some("shell".into()),
+                        pid: Some(42),
+                        workspace_id: Some(10),
+                        is_focused: true,
+                        is_floating: true, // floating → pin allowed
+                        column_index: None,
+                        position_in_column: None,
+                        width: 800,
+                        height: 600,
+                        floating_position: None,
+                    },
+                );
+                s.windows.insert(
+                    2,
+                    p::Window {
+                        id: 2,
+                        app_id: Some("foot".into()),
+                        title: Some("tiled".into()),
+                        pid: Some(43),
+                        workspace_id: Some(10),
+                        is_focused: false,
+                        is_floating: false, // tiled → pin refused
+                        column_index: Some(0),
+                        position_in_column: Some(0),
+                        width: 800,
+                        height: 600,
+                        floating_position: None,
+                    },
+                );
+                s.focused_window = Some(1);
+                s.focused_workspace = Some(10);
+            })
+            .await;
+        let task = spawn_accept_loop(listener, state.clone(), None);
+        ((tmp, xdg), sock_path, state, task)
+    }
+
+    #[tokio::test]
+    async fn pin_toggle_refuses_tiled_window() {
+        let (_dirs, path, _state, _task) = start_server_with_floating_window().await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(&mut w, r#"{"id":"a","op":"pin.toggle","params":{"window_id":2}}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], false);
+        let err = resp["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("only floating windows can be pinned"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_toggle_floating_succeeds_and_list_returns_record() {
+        let (_dirs, path, _state, _task) = start_server_with_floating_window().await;
+        let (mut lines, mut w) = connect(&path).await;
+        // Toggle on → pinned.
+        send_line(&mut w, r#"{"id":"a","op":"pin.toggle","params":{"window_id":1}}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true, "got: {resp}");
+        assert_eq!(resp["data"]["pinned"], true);
+        // pin.list → contains the window.
+        send_line(&mut w, r#"{"id":"l","op":"pin.list"}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true);
+        let arr = resp["data"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], 1);
+        assert_eq!(arr[0]["app_id"], "kitty");
+        // Toggle again → unpinned.
+        send_line(&mut w, r#"{"id":"b","op":"pin.toggle","params":{"window_id":1}}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"]["pinned"], false);
+    }
+
+    #[tokio::test]
+    async fn pin_off_returns_count_and_clears_set() {
+        let (_dirs, path, state, _task) = start_server_with_floating_window().await;
+        let (mut lines, mut w) = connect(&path).await;
+        // Add the floating window.
+        send_line(&mut w, r#"{"id":"a","op":"pin.add","params":{"window_id":1}}"#).await;
+        let _ = read_one_line(&mut lines).await;
+        // Off → 1 unpinned.
+        send_line(&mut w, r#"{"id":"o","op":"pin.off"}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["data"]["n_unpinned"], 1);
+        // State is empty.
+        let n = state.with(|s| s.pinned_windows.len()).await;
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn pin_remove_unknown_id_is_idempotent_success() {
+        let (_dirs, path, _state, _task) = start_server_with_floating_window().await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(&mut w, r#"{"id":"r","op":"pin.remove","params":{"window_id":999}}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["data"]["pinned"], false);
+    }
+
+    #[tokio::test]
+    async fn pin_add_drops_stale_pin_when_window_now_tiled() {
+        // R7 invariant: an already-pinned id whose live window has
+        // gone tiled (e.g. after a Mod+V toggle that auto-unpin missed)
+        // gets dropped + errored at pin.add time, not silently accepted.
+        // The mutation must also persist so memory and disk agree.
+        let (_dirs, path, state, _task) = start_server_with_floating_window().await;
+        // Pre-pin id 1 (seeded as floating).
+        state.with_mut(|s| { s.pinned_windows.insert(1); }).await;
+        // Flip the cache to non-floating without going through niri.
+        state
+            .with_mut(|s| {
+                if let Some(w) = s.windows.get_mut(&1) {
+                    w.is_floating = false;
+                }
+            })
+            .await;
+        let (mut lines, mut w) = connect(&path).await;
+        send_line(&mut w, r#"{"id":"a","op":"pin.add","params":{"window_id":1}}"#).await;
+        let resp = read_one_line(&mut lines).await;
+        assert_eq!(resp["ok"], false);
+        assert!(
+            resp["error"].as_str().unwrap_or("").contains("no longer floating"),
+            "got: {resp}"
+        );
+        // Stale pin removed from in-memory set.
+        let n = state.with(|s| s.pinned_windows.len()).await;
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]

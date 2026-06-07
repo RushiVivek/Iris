@@ -68,7 +68,7 @@ pub fn write_snapshot(name: &str, snap: &Snapshot, force: bool) -> Result<()> {
     let toml = snap.to_toml()?;
     let bytes = toml.as_bytes();
     if force {
-        write_atomic(&target, bytes)
+        crate::paths::write_atomic(&target, bytes)
             .with_context(|| format!("writing {}", target.display()))?;
     } else {
         write_atomic_no_clobber(&target, bytes)
@@ -128,19 +128,6 @@ fn list_in(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let dir = target
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("target {} has no parent", target.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(bytes)?;
-    tmp.flush()?;
-    tmp.persist(target)
-        .map_err(|e| anyhow::anyhow!("persisting tempfile: {e}"))?;
-    Ok(())
-}
-
 /// Atomic write that refuses to overwrite an existing target. Closes the
 /// TOCTOU window between an `exists()` check and `persist`: if the target
 /// exists when we try to rename, the kernel returns EEXIST and we surface
@@ -166,6 +153,7 @@ fn write_atomic_no_clobber(target: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bridge::proto::FloatingPosition;
+    use crate::paths::write_atomic;
     use crate::snapshot::schema::{Snapshot, WindowEntry, WorkspaceMeta};
     use chrono::{DateTime, Utc};
     use tempfile::TempDir;

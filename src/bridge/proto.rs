@@ -104,13 +104,31 @@ pub enum Op {
     #[serde(rename = "window.set_floating_position")]
     WindowSetFloatingPosition { id: u64, x: f64, y: f64 },
 
-    /// List pinned windows. Returns `[]` until W5 lands the pin set; kept
-    /// in the protocol now so `iris snapshot load --clear` doesn't need a
-    /// future client change to start respecting pins.
+    /// Add a window to the pin set. Refuses non-floating windows (per
+    /// the W5 locked decision: only floating windows can be pinned).
+    /// Idempotent: adding an already-pinned id returns ok without
+    /// changing state.
+    #[serde(rename = "pin.add")]
+    PinAdd { window_id: u64 },
+    /// Remove a window from the pin set. Idempotent: removing a
+    /// non-pinned id is a no-op success, returns `{"pinned": false}`.
+    #[serde(rename = "pin.remove")]
+    PinRemove { window_id: u64 },
+    /// Toggle a window's pin state. Returns the new state. Refuses
+    /// non-floating windows on the add side, same as `pin.add`.
+    #[serde(rename = "pin.toggle")]
+    PinToggle { window_id: u64 },
+    /// Clear the entire pin set. Returns the count of windows that were
+    /// unpinned (0 when already empty).
+    #[serde(rename = "pin.off")]
+    PinOff,
+    /// List pinned windows as full Window records (matches the
+    /// `windows.list` shape so callers can reuse parsers).
     #[serde(rename = "pin.list")]
     PinList,
-    /// List scratchpadded windows. Same forward-compat reasoning as
-    /// `pin.list`; populated in W6.
+    /// List scratchpadded windows. Returns `[]` until W6 lands the
+    /// scratchpad set; kept in the protocol now so `iris snapshot load
+    /// --clear` doesn't need a future client change.
     #[serde(rename = "scratchpad.list")]
     ScratchpadList,
 
@@ -340,6 +358,49 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sp, json!({"id": "s", "op": "scratchpad.list"}));
+    }
+
+    #[test]
+    fn pin_add_wire_shape() {
+        let req = Request {
+            id: "a".into(),
+            op: Op::PinAdd { window_id: 42 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "pin.add");
+        assert_eq!(v["params"], json!({"window_id": 42}));
+    }
+
+    #[test]
+    fn pin_remove_wire_shape() {
+        let req = Request {
+            id: "r".into(),
+            op: Op::PinRemove { window_id: 7 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "pin.remove");
+        assert_eq!(v["params"], json!({"window_id": 7}));
+    }
+
+    #[test]
+    fn pin_toggle_wire_shape() {
+        let req = Request {
+            id: "t".into(),
+            op: Op::PinToggle { window_id: 99 },
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "pin.toggle");
+        assert_eq!(v["params"], json!({"window_id": 99}));
+    }
+
+    #[test]
+    fn pin_off_wire_shape() {
+        let req = Request {
+            id: "o".into(),
+            op: Op::PinOff,
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v, json!({"id": "o", "op": "pin.off"}));
     }
 
     #[test]

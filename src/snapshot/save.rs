@@ -73,14 +73,18 @@ pub async fn run(
 }
 
 /// Query the bridge's pin and scratchpad lists, union'd into a HashSet.
-/// Empty in W3 (stubs). On error, log + treat as empty so save still
-/// works in degraded mode.
+/// `pin.list` returns `Vec<Window>` (W5); `scratchpad.list` still returns
+/// `[]` (stubbed until W6). Either way we extract `.id` from each entry.
+/// On error, log + treat as empty so save still works in degraded mode.
 async fn fetch_protected_ids(client: &IrisClient) -> Result<HashSet<u64>> {
     let mut ids = HashSet::new();
     for op in [Op::PinList, Op::ScratchpadList] {
         match client.request(op).await {
             Ok(Value::Array(arr)) => {
-                ids.extend(arr.into_iter().filter_map(|v| v.as_u64()));
+                ids.extend(
+                    arr.into_iter()
+                        .filter_map(|v| v.get("id").and_then(Value::as_u64)),
+                );
             }
             Ok(other) => {
                 warn!("expected array from pin/scratchpad list, got: {other}");

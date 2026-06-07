@@ -378,9 +378,15 @@ async fn fetch_windows(client: &IrisClient) -> Result<Vec<Window>> {
 }
 
 async fn fetch_protected_set(client: &IrisClient, op: Op) -> Result<HashSet<u64>> {
+    // `pin.list` returns `Vec<Window>` (W5); `scratchpad.list` still
+    // returns `[]` (stubbed until W6). Either way we extract `.id` from
+    // each entry.
     let v = client.request(op).await?;
     let ids: Vec<u64> = match v {
-        Value::Array(arr) => arr.into_iter().filter_map(|x| x.as_u64()).collect(),
+        Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|x| x.get("id").and_then(Value::as_u64))
+            .collect(),
         _ => Vec::new(),
     };
     Ok(ids.into_iter().collect())

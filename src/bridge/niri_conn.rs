@@ -29,6 +29,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use super::activation::ActivationBroker;
+use super::pinned;
 use super::proto::{self, topics};
 use super::state::SharedState;
 
@@ -216,15 +217,32 @@ async fn handle_niri_event(
 ) -> Result<()> {
     match ev {
         NiriEvent::WindowsChanged { windows } => {
-            state
+            // A bulk replay can drop windows without a prior WindowClosed
+            // (niri restarted, etc.) or report a previously-floating window
+            // as tiled. Reconcile the pin set against both: drop ids that
+            // are gone OR no longer floating, so the locked invariant
+            // ("only floating windows can be pinned") survives a replay.
+            let pin_changed = state
                 .with_mut(|s| {
                     s.windows = windows
                         .into_iter()
                         .map(|w| (w.id, normalize_window(&w)))
                         .collect();
+                    let before = s.pinned_windows.len();
+                    s.pinned_windows.retain(|id| {
+                        s.windows
+                            .get(id)
+                            .is_some_and(|w| w.is_floating)
+                    });
+                    s.pinned_windows.len() != before
                 })
                 .await;
             emit(state, topics::WINDOWS, serde_json::json!({"changed": "all"}));
+            if pin_changed {
+                if let Err(e) = pinned::persist(state).await {
+                    warn!("pin persist after windows replay failed: {e:#}");
+                }
+            }
         }
         NiriEvent::WindowOpenedOrChanged { window } => {
             let id = window.id;
@@ -259,15 +277,23 @@ async fn handle_niri_event(
             emit(state, topics::WINDOWS, payload);
         }
         NiriEvent::WindowClosed { id } => {
-            state
+            let was_pinned = state
                 .with_mut(|s| {
                     s.windows.remove(&id);
                     if s.focused_window == Some(id) {
                         s.focused_window = None;
                     }
+                    // Drop pin on close so future workspace switches
+                    // don't waste niri ops on a dead id.
+                    s.pinned_windows.remove(&id)
                 })
                 .await;
             emit(state, topics::WINDOWS, serde_json::json!({"closed": id}));
+            if was_pinned {
+                if let Err(e) = pinned::persist(state).await {
+                    warn!("pin persist after window close failed: {e:#}");
+                }
+            }
         }
         NiriEvent::WindowFocusChanged { id } => {
             state.with_mut(|s| s.focused_window = id).await;
@@ -305,6 +331,47 @@ async fn handle_niri_event(
                 topics::WORKSPACES,
                 serde_json::json!({"activated": id, "focused": focused}),
             );
+
+            // Pin follow: move every pinned window to the new active
+            // workspace. `focus: false` keeps focus on whatever the user
+            // just switched to. Errors logged + tolerated; one bad pin
+            // doesn't block the others.
+            //
+            // Filter to ids the cache currently agrees are floating.
+            // Auto-unpin's WindowOpenedOrChanged handler is async — a
+            // tile event could be in flight while WorkspaceActivated
+            // arrives, transiently leaving a tiled id in the pin set.
+            // Skipping it here keeps "only floating windows can be
+            // pinned" honest at the niri-action surface.
+            if focused {
+                let pinned: Vec<u64> = state
+                    .with(|s| {
+                        s.pinned_windows
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                s.windows
+                                    .get(id)
+                                    .is_some_and(|w| w.is_floating)
+                            })
+                            .collect()
+                    })
+                    .await;
+                for wid in pinned {
+                    let action = niri_ipc::Action::MoveWindowToWorkspace {
+                        window_id: Some(wid),
+                        reference: niri_ipc::WorkspaceReferenceArg::Id(id),
+                        focus: false,
+                    };
+                    if let Err(e) = query(niri_ipc::Request::Action(action)).await {
+                        warn!(
+                            window_id = wid,
+                            ws_id = id,
+                            "pin follow failed: {e:#}"
+                        );
+                    }
+                }
+            }
         }
         NiriEvent::WorkspaceActiveWindowChanged {
             workspace_id,
